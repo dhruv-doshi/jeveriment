@@ -14,9 +14,18 @@ class ResourceMonitor:
         self.stop = threading.Event()
         self.peak_rss = 0
 
+    @staticmethod
+    def _swap_used():
+        try:
+            return psutil.swap_memory().used
+        except (OSError, RuntimeError):
+            # macOS can expose swap counters conditionally; this is optional
+            # telemetry and must not prevent a phase from running.
+            return None
+
     def __enter__(self):
         self.started = time.monotonic()
-        self.swap_start = psutil.swap_memory().used
+        self.swap_start = self._swap_used()
         self.thread = threading.Thread(target=self._sample, daemon=True)
         self.thread.start()
         return self
@@ -36,7 +45,7 @@ class ResourceMonitor:
                 "elapsed_seconds": time.monotonic() - self.started,
                 "peak_rss_bytes": self.peak_rss,
                 "swap_used_start": self.swap_start,
-                "swap_used_end": psutil.swap_memory().used,
+                "swap_used_end": self._swap_used(),
                 "platform": platform.platform(),
                 "python": platform.python_version(),
                 "machine": platform.machine(),

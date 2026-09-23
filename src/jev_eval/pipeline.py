@@ -1,3 +1,4 @@
+import time
 import zipfile
 from pathlib import Path
 
@@ -32,11 +33,29 @@ def download_beir(name):
     url = (
         f"https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/{name}.zip"
     )
-    with httpx.stream("GET", url, follow_redirects=True, timeout=120) as response:
-        response.raise_for_status()
-        with archive.open("wb") as output:
-            for chunk in response.iter_bytes():
-                output.write(chunk)
+    partial = archive.with_suffix(".zip.part")
+    last_error = None
+    for attempt in range(3):
+        try:
+            with httpx.stream(
+                "GET", url, follow_redirects=True, timeout=120, trust_env=True
+            ) as response:
+                response.raise_for_status()
+                with partial.open("wb") as output:
+                    for chunk in response.iter_bytes():
+                        output.write(chunk)
+            partial.replace(archive)
+            break
+        except (httpx.HTTPError, OSError) as error:
+            last_error = error
+            partial.unlink(missing_ok=True)
+            if attempt < 2:
+                time.sleep(2**attempt)
+    else:
+        raise RuntimeError(
+            f"Could not download {name} from {url}. Check network/DNS or use "
+            "prepare --source PATH with a downloaded BEIR directory."
+        ) from last_error
     with zipfile.ZipFile(archive) as files:
         for name in files.namelist():
             target = (archive.parent / name).resolve()
