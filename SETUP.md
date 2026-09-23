@@ -1,8 +1,9 @@
 # Environment setup — first step
 
-Status: core implementation and testing are documented in `README.md`. Synthetic
-live capability checks have run. Benchmark experiments remain unrun at the user's
-explicit request. Follow `Jev_RAG_Retrieval_Final_Guide.md`, section 11, in phase order.
+Status: core implementation is documented in `docs/PROJECT.md`. Synthetic
+live capability checks and SciFact preparation have run, but dense retrieval
+and the benchmark remain incomplete. Follow
+`docs/Jev_RAG_Retrieval_Final_Guide.md`, section 11, in phase order.
 
 Fill in `.env` locally:
 

@@ -10,4 +10,5 @@ data/
 indices/
 embeddings/
 runs/
+reports/
 .DS_Store

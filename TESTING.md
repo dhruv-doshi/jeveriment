@@ -1,6 +1,6 @@
 # Verification handoff
 
-Verified on 2026-09-22:
+Verified on 2026-09-23:
 
 - `python -m pytest -q`: **31 passed**.
 - `ruff check src tests`: passed.
@@ -15,8 +15,9 @@ budget persistence, model drift, synthetic end-to-end exports/fallback, tiny-mod
 CPU inference, fusion leakage/search budgets, calibration, statistics, blinded
 audit requirements, plotting, remote score validation, and RAG evidence/resume.
 
-No real dataset experiment has run. No pretrained model weights were downloaded.
-Tests use authored data and tiny random architectures; pretrained-model quality,
+SciFact preparation completed locally; dense retrieval stopped during pretrained
+weight download, and no benchmark ranking/evaluation has run. Tests use authored
+data and tiny random architectures; pretrained-model quality,
 MPS performance, full-study resource usage, multilingual quality, and human
 calibration/generation judgments remain experimental validation work.
 
