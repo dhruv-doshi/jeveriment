@@ -5,8 +5,10 @@ downloads, real corpus reads, external API calls, or benchmark results occur.
 """
 
 import json
+from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from jev_eval import pipeline
 from jev_eval.config import Experiment
@@ -104,7 +106,78 @@ def test_full_synthetic_pipeline_resume_and_failure_reporting(tmp_path, monkeypa
     )
     result = pipeline.retrieve(config_path)
     assert result == {"queries": 8, "corpus": 20}
+    from jev_eval import scan
+
+    class FixtureJev:
+        calls = 0
+
+        def __init__(self, *args):
+            pass
+
+        def sentinel(self):
+            pass
+
+        def evaluate(self, state, questions, provenance=None):
+            FixtureJev.calls += 1
+            score = 0.9 if "Tides" in state["document"]["text"] else 0.1
+            return {"answers": {"candidate_000": {"noul": score}}}
+
+    monkeypatch.setattr(scan, "JevClient", FixtureJev)
+    monkeypatch.setattr(
+        scan.Settings, "load", classmethod(lambda cls: SimpleNamespace(model="jev"))
+    )
+    (tmp_path / "manifests").mkdir()
+    write_json(
+        tmp_path / "manifests" / "capabilities.json",
+        {"status": "noul_functional_checks_passed"},
+    )
+    with pytest.raises(ValueError, match="approve-pairs 40"):
+        scan.scan(config_path, 2, 39, 100, 100000)
+    assert FixtureJev.calls == 0
+    assert scan.scan(config_path, 2, 40, 100, 100000)["pairs"] == 40
+    assert scan.scan(config_path, 2, 40, 100, 100000)["pairs"] == 40
+    assert FixtureJev.calls == 40
+    assert scan.scan(config_path, 3, 60, 100, 100000)["pairs"] == 60
+    assert FixtureJev.calls == 60
+    comparison = scan.compare(config_path)
+    assert comparison["jev_full_scan"]["eligible_queries"] == 3
+    assert comparison["dense_cosine"]["eligible_queries"] == 3
     pools = read_json(dest / "pools.json")
+    from jev_eval import decisions
+
+    class FixtureSetJev:
+        calls = 0
+
+        def __init__(self, *args):
+            pass
+
+        def sentinel(self):
+            pass
+
+        def evaluate(self, state, questions, provenance=None):
+            FixtureSetJev.calls += 1
+            return {"answers": {"sufficient": {"noul": 0.9}}}
+
+    monkeypatch.setattr(decisions, "JevClient", FixtureSetJev)
+    write_json(
+        dest / "scores_jev.json",
+        {
+            "status": "complete",
+            "scores": {
+                q: {
+                    c["doc_id"]: (0.9 if int(c["doc_id"]) < 5 else 0.1)
+                    for c in pool["candidates"]
+                }
+                for q, pool in pools.items()
+            },
+        },
+    )
+    assert decisions.benchmark(config_path, 0.5, 100, 100000)["sets"] == 8
+    assert decisions.benchmark(config_path, 0.5, 100, 100000)["sets"] == 8
+    assert FixtureSetJev.calls == 8
+    decision_report = read_json(dest / "decision_benchmark.json")
+    assert decision_report["pair_metrics"]["jev_threshold"]["recall"] == 1.0
+    assert decision_report["set_proxy_metrics"]["jev_set"]["recall"] == 1.0
     original_hashes = {q: p["ordered_input_hash"] for q, p in pools.items()}
     assert pipeline.rerank(config_path, "qwen")["status"] == "complete"
     calls = FixtureReranker.calls

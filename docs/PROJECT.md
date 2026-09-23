@@ -22,14 +22,41 @@ The scripts run from any working directory. `CONFIG=path/to/config.yaml` selects
 - `jev.py`, `rubrics.py`, `ledger.py`, `preflight.py`: typed Jev requests, task prompts, strict response checks, capability gates, retry/cache, and persistent cost reservations. Score is disabled after a synthetic contract inconsistency; Noul is the experiment path.
 - `metrics.py`, `stats.py`, `calibration.py`, `audit.py`, `reporting.py`: relevance measures, paired inference, calibration, blinded audit support, and plots.
 - `expansion.py`, `generation.py`: optional externally produced fixed pools/scores and local evidence-constrained RAG generation. These are not part of the five pilot scripts.
+- `scan.py`, `decisions.py`: optional Jev full-corpus retrieval comparison and threshold/set-sufficiency decision benchmarks. Their live calls are separately budgeted and never part of the default five scripts.
 
 The core configurations cover SciFact, NFCorpus, FiQA, and ArguAna. Dataset-specific rubrics matter: SciFact seeks evidence for or against a claim; ArguAna seeks counterarguments and excludes self-matches. The pilot's default fusion is fixed RRF. Weight search and logistic baselines must be fit on development data, not the test split.
+
+## Jev as a first-stage retriever
+
+The main five-phase workflow first uses BM25 and dense cosine similarity to find candidates, then asks Jev to rerank their English text. The additional `jev-scan` arm tests a different question: can Jev find relevant documents directly from the whole corpus? It sends each frozen query/document text pair to Jev's independent Noul rubric, without embeddings or retrieval scores. It ranks all documents by Jev probability and compares Jev, BM25, and dense cosine top results on the **same selected queries**, with corpus-denominator nDCG@10, recall@10, MRR@10, and candidate recall at the configured retrieval depth. This is exhaustive model scoring, not a scalable Jev index.
+
+Run `02_prepare.sh` and `03_retrieve.sh` first. Then determine `queries × corpus_count` from the prepared manifest. For the default SciFact pilot that is `30 × 5,183 = 155,490` pair evaluations. Start with one query if desired; a full pilot requires an explicitly higher Vercel monetary allowance in `.env`, a request budget covering all attempts (including prior requests, retries, and the sentinel), and a suitably large token budget. Do not guess costs: inspect current Gateway pricing, account limits, and the shared `runs/budget.sqlite` ledger before authorizing this scan. The script requires an exact pair-count acknowledgment and does not run as part of `05_evaluate.sh`.
+
+```bash
+./scripts/06_jev_scan.sh 1 5183 REQUEST_BUDGET TOKEN_BUDGET
+# Later, to extend the same checkpoint to all 30 pilot queries:
+./scripts/06_jev_scan.sh 30 155490 REQUEST_BUDGET TOKEN_BUDGET
+```
+
+Replace the budget placeholders with explicit positive integers. The scan checkpoints scores every 100 corpus positions and at each completed query to `jev_scan_scores.json`; individual successful requests are also cached in the shared ledger, so a rerun can recover any work since the last score checkpoint without paying for it again. `retrieval_summary.json`, `retrieval_per_query_metrics.json`, and `retrieval_{bm25,dense_cosine,jev_full_scan}.trec` contain the matched comparison. Raw Jev requests/responses, timestamped logs, and `resources_jev_scan.json` are retained too. Do not compare these full-corpus retrieval results directly with fixed-pool reranking scores as though the tasks had the same candidate access or cost.
+
+## Acceptance and evidence sufficiency
+
+`07_decisions.sh` is another optional benchmark. It requires complete fixed-pool Jev scores from `04_rerank.sh jev`. At a threshold frozen before test evaluation, it compares Jev's yes/no document acceptance against accepting a fixed top-k from the same pool. Pair-level precision, recall, and acceptance rate use **explicitly judged pairs only**; unjudged pairs are never converted into negatives. The two methods need not accept the same number of documents, so report acceptance rate alongside quality and do not call this a matched-coverage comparison.
+
+For each query, the script also sends the selected top-k English documents together to Jev and asks whether the set is sufficient for the task. It compares that decision with two basic rules: accept if the highest individual Jev probability exceeds the same threshold, or always accept. The available BEIR-derived proxy records whether the selected set contains at least one **known** relevant document. That proxy is not an independently verified answer-sufficiency label: a set can contain a relevant document yet lack complete support, and an unjudged document may supply support. Interpret set-level proxy metrics as diagnostics only. A real sufficiency/abstention claim requires an independently assessed set-level or answer-level audit.
+
+```bash
+./scripts/07_decisions.sh FROZEN_THRESHOLD REQUEST_BUDGET TOKEN_BUDGET
+```
+
+Choose the threshold using development queries, then keep it unchanged on held-out queries; do not tune it on the test split. Request/token budget arguments are explicit positive integers and share the Vercel ledger and `.env` monetary cap. This command makes one set-level Jev evaluation per query plus a daily sentinel, with retries if necessary. `decision_scores.json` stores resumable set probabilities; `decision_benchmark.json` stores all pair/set rows, confusion counts, precision, recall, acceptance rates, threshold, and label-scope warnings. Raw responses, resource telemetry, and timestamped logs remain under the same run directory. The four existing BEIR configurations already cover distinct domains, so no additional dataset is needed for the initial comparison; stronger claims still require held-out runs and human labels.
 
 ## What is preserved
 
 All paths below are under `runs/<experiment_id>/` unless noted. `logs/` contains a new UTC-stamped stdout/stderr transcript for every scripted phase invocation; a nonzero pipeline exit is retained as such. `resources_prepare.json`, `resources_retrieve.json`, `resources_rerank_{qwen,bge,jev}.json`, and `resources_evaluate.json` record elapsed time, peak RSS, swap, platform, and success/failure. They are summaries, not GPU-profiler traces.
 
-Preparation keeps `dataset_manifest.json`, `model_manifest.json`, `input_config.json`, `resolved_config.{json,yaml}`, `corpus.sqlite`, `queries.json`, `qrels.json`, and `text_views.json`. Retrieval keeps the BM25 index and scores, `embeddings.npy`, `embedding_checkpoint.json`, row IDs, `pools.json`, `source_runs.json`, and `candidates.parquet`. Reranking keeps `scores_<system>.json`, Jev raw requests/responses and model catalog, plus the shared `runs/budget.sqlite` ledger. Evaluation keeps `per_query_metrics.{json,parquet}`, `scores.parquet`, `summary.json`, selections, TREC files, and plots; `reports/<experiment_id>.md` is a compact human-readable summary. JSON checkpoints are atomically replaced. Raw scores and per-query rows are preserved so later analyses need not rely on rounded report values.
+Preparation keeps `dataset_manifest.json`, `model_manifest.json`, `input_config.json`, `resolved_config.{json,yaml}`, `corpus.sqlite`, `queries.json`, `qrels.json`, and `text_views.json`. Retrieval keeps the BM25 index and scores, `embeddings.npy`, `embedding_checkpoint.json`, row IDs, `pools.json`, `source_runs.json`, and `candidates.parquet`. Reranking keeps `scores_<system>.json`, Jev raw requests/responses and model catalog, plus the shared `runs/budget.sqlite` ledger. Evaluation keeps `per_query_metrics.{json,parquet}`, `scores.parquet`, `summary.json`, selections, TREC files, and plots; `reports/<experiment_id>.md` is a compact human-readable summary. JSON checkpoints are atomically replaced. Raw scores and per-query rows are preserved so later analyses need not rely on rounded report values. The optional Jev scan adds its own scores, retrieval metrics, TREC exports, raw responses, and log.
 
 Generated files are git-ignored and can be large. Back up `runs/`, `reports/`, `data/`, and the model cache if you need reproducibility across machines. Do not publish raw requests, responses, logs, or ledgers without reviewing them for query/document content and account metadata. The API key is not serialized by the client.
 

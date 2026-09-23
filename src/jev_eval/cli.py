@@ -11,6 +11,19 @@ def main():
     check = sub.add_parser("validate-config")
     check.add_argument("config")
     sub.add_parser("preflight")
+    scan = sub.add_parser("jev-scan", help="Explicit Jev full-corpus retrieval")
+    scan.add_argument("config")
+    scan.add_argument("--queries", type=int, required=True)
+    scan.add_argument("--approve-pairs", type=int, required=True)
+    scan.add_argument("--request-budget", type=int, required=True)
+    scan.add_argument("--token-budget", type=int, required=True)
+    comparison = sub.add_parser("compare-retrieval")
+    comparison.add_argument("config")
+    decisions = sub.add_parser("benchmark-decisions")
+    decisions.add_argument("config")
+    decisions.add_argument("--threshold", type=float, required=True)
+    decisions.add_argument("--request-budget", type=int, required=True)
+    decisions.add_argument("--token-budget", type=int, required=True)
     for name in ("prepare", "retrieve", "rerank", "evaluate"):
         command = sub.add_parser(name)
         command.add_argument("config")
@@ -80,6 +93,47 @@ def main():
                 }
             )
         )
+    elif args.command == "jev-scan":
+        from .pipeline import run_dir
+        from .resources import ResourceMonitor
+        from .scan import scan
+
+        with ResourceMonitor(
+            run_dir(load_config(args.config)) / "resources_jev_scan.json"
+        ):
+            print(
+                json.dumps(
+                    scan(
+                        args.config,
+                        args.queries,
+                        args.approve_pairs,
+                        args.request_budget,
+                        args.token_budget,
+                    )
+                )
+            )
+    elif args.command == "compare-retrieval":
+        from .scan import compare
+
+        print(json.dumps(compare(args.config)))
+    elif args.command == "benchmark-decisions":
+        from .decisions import benchmark
+        from .pipeline import run_dir
+        from .resources import ResourceMonitor
+
+        with ResourceMonitor(
+            run_dir(load_config(args.config)) / "resources_benchmark_decisions.json"
+        ):
+            print(
+                json.dumps(
+                    benchmark(
+                        args.config,
+                        args.threshold,
+                        args.request_budget,
+                        args.token_budget,
+                    )
+                )
+            )
     elif args.command in {"prepare", "retrieve", "rerank", "evaluate"}:
         from . import pipeline
         from .resources import ResourceMonitor
