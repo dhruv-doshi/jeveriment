@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$ROOT_DIR"
-CONFIG="${CONFIG:-configs/pilot.yaml}"
+source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
+require_environment
 
-.venv/bin/python -m jev_eval evaluate "$CONFIG"
-.venv/bin/python -m jev_eval plot runs/scifact_train_pilot_v1
+run_logged evaluate .venv/bin/python -m jev_eval evaluate "$CONFIG"
+run_logged plot .venv/bin/python -m jev_eval plot "$(run_directory)"
 
 echo "Evaluation and plotting complete."

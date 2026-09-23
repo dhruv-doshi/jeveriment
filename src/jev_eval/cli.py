@@ -85,9 +85,12 @@ def main():
         from .resources import ResourceMonitor
 
         config = load_config(args.config)
-        with ResourceMonitor(
-            pipeline.run_dir(config) / f"resources_{args.command}.json"
-        ):
+        phase = (
+            f"{args.command}_{args.system}"
+            if args.command == "rerank"
+            else args.command
+        )
+        with ResourceMonitor(pipeline.run_dir(config) / f"resources_{phase}.json"):
             kwargs = (
                 {"source": args.source}
                 if args.command == "prepare"

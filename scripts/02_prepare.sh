@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$ROOT_DIR"
-CONFIG="${CONFIG:-configs/pilot.yaml}"
+source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
+require_environment
 
-.venv/bin/python -m jev_eval prepare "$CONFIG"
+run_logged prepare .venv/bin/python -m jev_eval prepare "$CONFIG" "$@"
