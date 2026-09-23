@@ -1,6 +1,7 @@
 """Pinned local inference; text truncation is owned by the shared-view builder."""
 
 import gc
+import warnings
 
 import numpy as np
 
@@ -20,11 +21,50 @@ def reranker_text(query, document, task=TASK):
 def device_name(requested="auto"):
     import torch
 
-    return (
-        ("mps" if torch.backends.mps.is_available() else "cpu")
-        if requested == "auto"
-        else requested
-    )
+    if requested != "auto":
+        return requested
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+class _DeviceFallback:
+    def _place_model(self):
+        try:
+            self.model.to(self.device)
+        except (RuntimeError, NotImplementedError) as error:
+            if self.device == "cpu":
+                raise
+            self._move_to_cpu(error)
+        self.model.eval()
+
+    def _move_to_cpu(self, error):
+        import torch
+
+        accelerator = self.device
+        self.device = "cpu"
+        gc.collect()
+        if accelerator == "mps" and torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+        elif accelerator.startswith("cuda") and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        self.model.to("cpu")
+        warnings.warn(
+            f"Inference on {accelerator} failed; continuing on CPU: {error}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+    def _run_with_fallback(self, run):
+        try:
+            return run()
+        except (RuntimeError, NotImplementedError) as error:
+            if self.device == "cpu":
+                raise
+            self._move_to_cpu(error)
+            return run()
 
 
 def release(model):
@@ -36,7 +76,7 @@ def release(model):
         torch.mps.empty_cache()
 
 
-class DenseModel:
+class DenseModel(_DeviceFallback):
     def __init__(self, name, revision, device="auto", max_length=512, task=TASK):
         import torch
         from transformers import AutoModel, AutoTokenizer
@@ -50,13 +90,10 @@ class DenseModel:
         self.tokenizer = AutoTokenizer.from_pretrained(
             name, revision=revision, padding_side="left" if self.qwen else "right"
         )
-        self.model = (
-            AutoModel.from_pretrained(
-                name, revision=revision, torch_dtype=torch.float32
-            )
-            .to(self.device)
-            .eval()
+        self.model = AutoModel.from_pretrained(
+            name, revision=revision, torch_dtype=torch.float32
         )
+        self._place_model()
         self.max_length = max_length
         self.task = task
 
@@ -74,18 +111,25 @@ class DenseModel:
             raise ValueError(
                 "Dense input exceeds frozen length; shared view must be rebuilt"
             )
-        with torch.inference_mode():
-            hidden = self.model(**encoded.to(self.device)).last_hidden_state
-            output = hidden[:, -1] if self.qwen else hidden[:, 0]
-            result = (
-                torch.nn.functional.normalize(output, p=2, dim=1).float().cpu().numpy()
-            )
+
+        def run():
+            with torch.inference_mode():
+                hidden = self.model(**encoded.to(self.device)).last_hidden_state
+                output = hidden[:, -1] if self.qwen else hidden[:, 0]
+                return (
+                    torch.nn.functional.normalize(output, p=2, dim=1)
+                    .float()
+                    .cpu()
+                    .numpy()
+                )
+
+        result = self._run_with_fallback(run)
         if not np.isfinite(result).all():
             raise ValueError("Nonfinite dense embedding")
         return result
 
 
-class LocalReranker:
+class LocalReranker(_DeviceFallback):
     def __init__(self, name, revision, device="auto", max_length=512, task=TASK):
         import torch
         from transformers import (
@@ -104,11 +148,10 @@ class LocalReranker:
             name, revision=revision, padding_side="left" if self.qwen else "right"
         )
         cls = AutoModelForCausalLM if self.qwen else AutoModelForSequenceClassification
-        self.model = (
-            cls.from_pretrained(name, revision=revision, torch_dtype=torch.float32)
-            .to(self.device)
-            .eval()
+        self.model = cls.from_pretrained(
+            name, revision=revision, torch_dtype=torch.float32
         )
+        self._place_model()
 
     def score(self, query, texts):
         import torch
@@ -131,16 +174,19 @@ class LocalReranker:
             )
         if encoded["input_ids"].shape[1] > self.max_length:
             raise ValueError("Reranker input exceeds frozen shared-view limit")
-        with torch.inference_mode():
-            logits = self.model(**encoded.to(self.device)).logits
-            if self.qwen:
-                no, yes = [
-                    self.tokenizer.convert_tokens_to_ids(t) for t in ("no", "yes")
-                ]
-                logits = logits[:, -1, [no, yes]].float()
-                result = torch.softmax(logits, dim=-1)[:, 1].cpu().tolist()
-            else:
-                result = logits.view(-1).float().cpu().tolist()
+
+        def run():
+            with torch.inference_mode():
+                logits = self.model(**encoded.to(self.device)).logits
+                if self.qwen:
+                    no, yes = [
+                        self.tokenizer.convert_tokens_to_ids(t) for t in ("no", "yes")
+                    ]
+                    logits = logits[:, -1, [no, yes]].float()
+                    return torch.softmax(logits, dim=-1)[:, 1].cpu().tolist()
+                return logits.view(-1).float().cpu().tolist()
+
+        result = self._run_with_fallback(run)
         if not np.isfinite(result).all():
             raise ValueError("Nonfinite reranker scores")
         return result
