@@ -1,0 +1,7 @@
+experiment_id: core_fiqa_v1
+dataset: fiqa
+task: question_answering
+split: test
+sample_queries: null
+pool_size: 100
+confirmatory: false

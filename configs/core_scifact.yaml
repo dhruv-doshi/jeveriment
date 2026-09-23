@@ -1,0 +1,9 @@
+# Preparation template: freeze revisions and resolve the Jev version gate before
+# setting confirmatory: true. No commands are scheduled automatically.
+experiment_id: core_scifact_v1
+dataset: scifact
+task: scientific_claim_evidence
+split: test
+sample_queries: null
+pool_size: 100
+confirmatory: false

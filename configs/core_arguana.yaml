@@ -1,0 +1,8 @@
+experiment_id: core_arguana_v1
+dataset: arguana
+task: counterargument
+split: test
+sample_queries: null
+pool_size: 100
+exclude_self_match: true
+confirmatory: false

@@ -1,0 +1,7 @@
+experiment_id: core_nfcorpus_v1
+dataset: nfcorpus
+task: question_answering
+split: test
+sample_queries: null
+pool_size: 100
+confirmatory: false
