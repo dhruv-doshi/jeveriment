@@ -1,7 +1,9 @@
 import math
 import random
 import time
+from datetime import datetime, timezone
 from decimal import Decimal
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 import httpx
@@ -87,6 +89,22 @@ class JevClient:
         self.pricing = None
         self.pricing_time = 0.0
         self.resolved_model = None
+        self.rate_limiter = None
+
+    @staticmethod
+    def retry_delay(value, fallback):
+        if value is None:
+            return fallback
+        try:
+            return max(0.0, float(value))
+        except (TypeError, ValueError):
+            try:
+                when = parsedate_to_datetime(value)
+                if when.tzinfo is None:
+                    when = when.replace(tzinfo=timezone.utc)
+                return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+            except (TypeError, ValueError, IndexError):
+                return fallback
 
     def discover(self):
         # Pricing metadata is public; authentication is restricted to Vercel.
@@ -137,6 +155,8 @@ class JevClient:
         if len(canonical(payload).encode()) > context:
             raise ValueError("Request exceeds conservative UTF-8 context gate")
         for retry in range(self.max_attempts):
+            if self.rate_limiter is not None:
+                self.rate_limiter.acquire()
             attempt = self.ledger.reserve(
                 key,
                 usd,
@@ -188,19 +208,23 @@ class JevClient:
                 self.ledger.finish(
                     attempt, "http_error", raw_path, error=str(response.status_code)
                 )
+                if response.status_code == 429 and self.rate_limiter is not None:
+                    self.rate_limiter.penalize(
+                        self.retry_delay(response.headers.get("retry-after"), 2**retry)
+                    )
                 if (
                     response.status_code in {429, 529, 500, 502, 503, 504}
                     and retry + 1 < self.max_attempts
                 ):
-                    try:
-                        delay = float(response.headers.get("retry-after", 2**retry))
-                    except ValueError:
-                        delay = 2**retry
-                    if delay > 60:
-                        raise RuntimeError(
-                            "Provider requests long backoff; resume later"
+                    if response.status_code != 429 or self.rate_limiter is None:
+                        delay = self.retry_delay(
+                            response.headers.get("retry-after"), 2**retry
                         )
-                    time.sleep(max(0, delay) + random.random())
+                        if delay > 60:
+                            raise RuntimeError(
+                                "Provider requests long backoff; resume later"
+                            )
+                        time.sleep(delay + random.random())
                     continue
                 raise RuntimeError(
                     f"Gateway HTTP {response.status_code}; see saved response {raw_path}"
@@ -242,6 +266,8 @@ class JevClient:
                 raise
             self.ledger.finish(attempt, "success", raw_path, cost, tokens)
             self.ledger.success(key, raw_path, body["model"])
+            if self.rate_limiter is not None:
+                self.rate_limiter.succeeded()
             if Decimal(self.ledger.totals()["cost_usd"]) > self.settings.max_cost_usd:
                 raise ValueError(
                     "Provider reported cost above reservation; monetary cap exceeded, stop"

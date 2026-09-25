@@ -17,6 +17,8 @@ def main():
     scan.add_argument("--approve-pairs", type=int, required=True)
     scan.add_argument("--request-budget", type=int, required=True)
     scan.add_argument("--token-budget", type=int, required=True)
+    scan.add_argument("--workers", type=int, default=4)
+    scan.add_argument("--requests-per-second", type=float, default=2.0)
     comparison = sub.add_parser("compare-retrieval")
     comparison.add_argument("config")
     decisions = sub.add_parser("benchmark-decisions")
@@ -109,6 +111,8 @@ def main():
                         args.approve_pairs,
                         args.request_budget,
                         args.token_budget,
+                        args.workers,
+                        args.requests_per_second,
                     )
                 )
             )

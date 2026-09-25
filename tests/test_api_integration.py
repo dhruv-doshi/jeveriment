@@ -81,6 +81,56 @@ def test_error_only_retry_and_model_drift(tmp_path, monkeypatch):
     assert client.ledger.cached("unknown") is None
 
 
+def test_rate_limit_pauses_shared_limiter_before_retry(tmp_path, monkeypatch):
+    client, calls = fixture_client(
+        tmp_path,
+        monkeypatch,
+        [(429, {"error": "rate limit"}), (200, response())],
+    )
+
+    class Limiter:
+        def __init__(self):
+            self.events = []
+
+        def acquire(self):
+            self.events.append("acquire")
+
+        def penalize(self, delay):
+            self.events.append(("penalize", delay))
+
+        def succeeded(self):
+            self.events.append("success")
+
+    client.rate_limiter = Limiter()
+    client.http.close()
+
+    def handler(request):
+        calls.append(request)
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "data": [{
+                        "id": "typesafe-ai/jev",
+                        "context_window": 32000,
+                        "pricing": {"input": "0.000000042", "output": "0"},
+                    }]
+                },
+            )
+        if len([r for r in calls if r.method == "POST"]) == 1:
+            return httpx.Response(429, headers={"retry-after": "90"}, json={})
+        return httpx.Response(200, json=response())
+
+    client.http = httpx.Client(transport=httpx.MockTransport(handler))
+    client.evaluate("text", {"r": {"type": "noul", "instructions": "fixture"}})
+    assert client.rate_limiter.events == [
+        "acquire",
+        ("penalize", 90.0),
+        "acquire",
+        "success",
+    ]
+
+
 def test_auth_error_fails_fast_and_malformed_not_cached(tmp_path, monkeypatch):
     client, calls = fixture_client(
         tmp_path, monkeypatch, [(403, {"error": "verification"})]

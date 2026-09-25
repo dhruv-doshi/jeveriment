@@ -1,5 +1,11 @@
 """Explicit, resumable Jev full-corpus retrieval and matched dense comparison."""
 
+import fcntl
+import threading
+import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from contextlib import contextmanager
+
 from .config import Settings
 from .io import digest, read_json, write_json
 from .jev import JevClient
@@ -8,7 +14,80 @@ from .pipeline import load_run
 from .rubrics import build_request
 
 
-def scan(config_path, query_count, approved_pairs, request_budget, token_budget):
+class SharedRateLimiter:
+    """Pace all workers and make a 429 pause apply to the entire scan."""
+
+    def __init__(self, requests_per_second):
+        if requests_per_second <= 0:
+            raise ValueError("requests_per_second must be positive")
+        self.maximum = requests_per_second
+        self.rate = requests_per_second
+        self.condition = threading.Condition()
+        self.next_at = 0.0
+        self.pause_until = 0.0
+        self.successes = 0
+
+    def acquire(self):
+        with self.condition:
+            while True:
+                now = time.monotonic()
+                wait_for = max(self.next_at, self.pause_until) - now
+                if wait_for <= 0:
+                    self.next_at = now + 1 / self.rate
+                    return
+                self.condition.wait(wait_for)
+
+    def penalize(self, retry_after):
+        with self.condition:
+            now = time.monotonic()
+            if now >= self.pause_until:
+                self.rate = max(0.1, self.rate / 2)
+                self.successes = 0
+            self.pause_until = max(
+                self.pause_until, now + max(1.0, retry_after)
+            )
+            self.condition.notify_all()
+        print(
+            f"Jev 429: pausing workers for at least {retry_after:.1f}s; "
+            f"rate now {self.rate:.2f} requests/s",
+            flush=True,
+        )
+
+    def succeeded(self):
+        with self.condition:
+            self.successes += 1
+            if self.successes >= 50 and self.rate < self.maximum:
+                self.rate = min(self.maximum, self.rate * 1.25)
+                self.successes = 0
+                self.condition.notify_all()
+
+
+@contextmanager
+def scan_lock(dest):
+    path = dest / "jev_scan.lock"
+    with path.open("a+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError("Another parallel Jev scan is using this run") from None
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def scan(
+    config_path,
+    query_count,
+    approved_pairs,
+    request_budget,
+    token_budget,
+    workers=4,
+    requests_per_second=2.0,
+):
+    if not 1 <= workers <= 32:
+        raise ValueError("workers must be between 1 and 32")
+    limiter = SharedRateLimiter(requests_per_second)
     config, dest = load_run(config_path)
     queries = read_json(dest / "queries.json")
     views = read_json(dest / "text_views.json")
@@ -44,50 +123,115 @@ def scan(config_path, query_count, approved_pairs, request_budget, token_budget)
         raise ValueError("Jev scan checkpoint provenance changed")
     if set(saved["scores"]) - set(selected):
         raise ValueError("Jev scan checkpoint contains unexpected queries")
-    client = JevClient(
-        settings, dest, token_budget, request_budget, config.max_attempts
-    )
-    try:
-        client.sentinel()
-        for q in selected:
-            scores = saved["scores"].setdefault(q, {})
-            if set(scores) - set(ids):
-                raise ValueError("Jev scan checkpoint contains unexpected documents")
-            for index, d in enumerate(ids, 1):
-                if d in scores:
-                    continue
-                state, questions, mapping = build_request(
-                    queries[q]["text"],
-                    [{"doc_id": d, "text": views[d]["text"]}],
-                    config.task,
-                    "independent",
+    with scan_lock(dest):
+        client = JevClient(
+            settings, dest, token_budget, request_budget, config.max_attempts
+        )
+        clients = []
+        clients_lock = threading.Lock()
+        local = threading.local()
+
+        def score_pair(q, d):
+            worker = getattr(local, "client", None)
+            if worker is None:
+                worker = JevClient(
+                    settings, dest, token_budget, request_budget, config.max_attempts
                 )
-                response = client.evaluate(
-                    state,
-                    questions,
-                    provenance={
-                        "role": "full_corpus_retrieval",
-                        "query_id": q,
-                        "document_id": d,
-                        "text_hash": views[d]["hash"],
-                        "corpus": config.corpus_revision,
-                    },
-                )
-                scores[d] = response["answers"][next(iter(mapping))]["noul"]
-                if index % 100 == 0:
-                    write_json(path, saved)
-            write_json(path, saved)
-            print(
-                f"Jev scan: completed query {q} ({len(saved['scores'])}/{len(selected)})",
-                flush=True,
+                worker.rate_limiter = limiter
+                # Reuse the catalog fetched by the sentinel. Each thread owns its
+                # HTTP connection and SQLite connection.
+                for name in ("pricing", "pricing_time", "catalog_model", "resolved_model"):
+                    if hasattr(client, name):
+                        setattr(worker, name, getattr(client, name))
+                local.client = worker
+                with clients_lock:
+                    clients.append(worker)
+            state, questions, mapping = build_request(
+                queries[q]["text"],
+                [{"doc_id": d, "text": views[d]["text"]}],
+                config.task,
+                "independent",
             )
-        saved["status"] = "complete"
-    except Exception as error:
-        saved["status"] = "incomplete"
-        saved["failure_type"] = type(error).__name__
+            response = worker.evaluate(
+                state,
+                questions,
+                provenance={
+                    "role": "full_corpus_retrieval",
+                    "query_id": q,
+                    "document_id": d,
+                    "text_hash": views[d]["hash"],
+                    "corpus": config.corpus_revision,
+                },
+            )
+            return response["answers"][next(iter(mapping))]["noul"]
+
+        try:
+            client.sentinel()
+            saved.pop("failure_type", None)
+            saved["status"] = "incomplete"
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                for q in selected:
+                    scores = saved["scores"].setdefault(q, {})
+                    if set(scores) - set(ids):
+                        raise ValueError(
+                            "Jev scan checkpoint contains unexpected documents"
+                        )
+                    remaining = iter(d for d in ids if d not in scores)
+                    pending = {}
+                    first_error = None
+
+                    def fill_queue():
+                        while len(pending) < workers * 2:
+                            try:
+                                d = next(remaining)
+                            except StopIteration:
+                                return
+                            pending[pool.submit(score_pair, q, d)] = d
+
+                    fill_queue()
+                    while pending:
+                        done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                        for future in done:
+                            d = pending.pop(future)
+                            if future.cancelled():
+                                continue
+                            try:
+                                scores[d] = future.result()
+                            except Exception as error:
+                                if first_error is None:
+                                    first_error = error
+                            if len(scores) and len(scores) % 100 == 0:
+                                write_json(path, saved)
+                                print(
+                                    f"Jev scan: query {q}, {len(scores)}/{len(ids)} documents",
+                                    flush=True,
+                                )
+                        if first_error is not None:
+                            for future in pending:
+                                future.cancel()
+                        else:
+                            fill_queue()
+                    if first_error is not None:
+                        raise first_error
+                    write_json(path, saved)
+                    print(
+                        f"Jev scan: completed query {q} "
+                        f"({len(saved['scores'])}/{len(selected)})",
+                        flush=True,
+                    )
+            saved["status"] = "complete"
+        except Exception as error:
+            saved["status"] = "incomplete"
+            saved["failure_type"] = type(error).__name__
+            write_json(path, saved)
+            raise
+        finally:
+            for worker in [client, *clients]:
+                if hasattr(worker, "http"):
+                    worker.http.close()
+                if hasattr(worker, "ledger"):
+                    worker.ledger.db.close()
         write_json(path, saved)
-        raise
-    write_json(path, saved)
     return {"queries": len(selected), "documents": len(ids), "pairs": pairs}
 
 

@@ -5,6 +5,8 @@ downloads, real corpus reads, external API calls, or benchmark results occur.
 """
 
 import json
+import threading
+import time
 from types import SimpleNamespace
 
 import numpy as np
@@ -110,6 +112,9 @@ def test_full_synthetic_pipeline_resume_and_failure_reporting(tmp_path, monkeypa
 
     class FixtureJev:
         calls = 0
+        active = 0
+        max_active = 0
+        lock = threading.Lock()
 
         def __init__(self, *args):
             pass
@@ -118,9 +123,19 @@ def test_full_synthetic_pipeline_resume_and_failure_reporting(tmp_path, monkeypa
             pass
 
         def evaluate(self, state, questions, provenance=None):
-            FixtureJev.calls += 1
-            score = 0.9 if "Tides" in state["document"]["text"] else 0.1
-            return {"answers": {"candidate_000": {"noul": score}}}
+            with FixtureJev.lock:
+                FixtureJev.calls += 1
+                FixtureJev.active += 1
+                FixtureJev.max_active = max(
+                    FixtureJev.max_active, FixtureJev.active
+                )
+            try:
+                time.sleep(0.002)
+                score = 0.9 if "Tides" in state["document"]["text"] else 0.1
+                return {"answers": {"candidate_000": {"noul": score}}}
+            finally:
+                with FixtureJev.lock:
+                    FixtureJev.active -= 1
 
     monkeypatch.setattr(scan, "JevClient", FixtureJev)
     monkeypatch.setattr(
@@ -137,6 +152,7 @@ def test_full_synthetic_pipeline_resume_and_failure_reporting(tmp_path, monkeypa
     assert scan.scan(config_path, 2, 40, 100, 100000)["pairs"] == 40
     assert scan.scan(config_path, 2, 40, 100, 100000)["pairs"] == 40
     assert FixtureJev.calls == 40
+    assert FixtureJev.max_active > 1
     assert scan.scan(config_path, 3, 60, 100, 100000)["pairs"] == 60
     assert FixtureJev.calls == 60
     comparison = scan.compare(config_path)

@@ -25,6 +25,8 @@ When you are ready to run the pilot, execute each phase in order:
 
 To test Jev as the **retriever itself**, use the separate, opt-in [full-corpus scan](docs/PROJECT.md#jev-as-a-first-stage-retriever) after Phase 3. It scores raw query/document text, not embeddings, and compares Jev's top results with BM25 and dense cosine retrieval. It is not included in the default five scripts because the 30-query SciFact pilot requires 155,490 Jev document evaluations.
 
+The scan uses four request workers by default, capped at two request starts per second, and slows all workers when the Gateway returns 429. Add `--workers N --requests-per-second RATE` after its four required arguments to change the limits. Progress is logged every 100 completed documents; rerunning resumes scores and cached responses. Run only one scan for an experiment ID at a time.
+
 An additional [decision benchmark](docs/PROJECT.md#acceptance-and-evidence-sufficiency) tests Jev's document-acceptance threshold against fixed top-k selection, and Jev's set-level evidence judgment against simple acceptance rules. Run it explicitly after Jev fixed-pool reranking; it is not a substitute for a human answer-sufficiency audit.
 
 Outputs, raw API responses, checkpoints, metrics, plots, resource records, and timestamped command logs are saved under `runs/<experiment_id>/`; a readable report is written to `reports/<experiment_id>.md`. These generated directories and `.env` are git-ignored. Back them up separately if you need to retain experiment data.
