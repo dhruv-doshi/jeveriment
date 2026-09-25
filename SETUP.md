@@ -1,47 +1,43 @@
-# Environment setup — first step
+# Direct TypeSafe setup
 
-Status: core implementation is documented in `docs/PROJECT.md`. Synthetic
-live capability checks and SciFact preparation have run, but dense retrieval
-and the benchmark remain incomplete. Follow
-`docs/Jev_RAG_Retrieval_Final_Guide.md`, section 11, in phase order.
+This worktree calls TypeSafe directly at `https://api.typesafe.ai/v1/systemone`.
+The existing Vercel run in the main checkout keeps its own credentials, ledger,
+and scan checkpoint.
 
-Fill in `.env` locally:
+Fill in this worktree's `.env`:
 
-- `AI_GATEWAY_API_KEY`: create an AI Gateway key in your Vercel team's dashboard.
-- `JEV_MAX_COST_USD`: your total USD allowance for the initial capability preflight
-  and SciFact training pilot, including retries. Set `0` for verified free-only
-  execution. Blank must block live execution. This project setting will be enforced
-  by the harness before live requests; creating this file does not configure a
-  Vercel account budget. A matching Vercel key budget provides provider-side control.
-- `HF_TOKEN`: optional read token for Hugging Face; public pilot models do not
-  require it. Gated extensions may require both a token and access approval later.
+- `TYPESAFE_API_KEY`: a direct API key from the TypeSafe console. Keep it in `.env`.
+- `JEV_MODEL`: use the pinned `jev-1.13.0` unless you intentionally start a new
+  model segment. TypeSafe's `jev-latest` alias can move.
+- `JEV_MAX_COST_USD`: local direct API allowance. Enter the amount you authorize
+  before live calls. This does not configure an account limit.
+- `JEV_INPUT_USD_PER_MILLION_TOKENS`: the published direct input price, currently
+  `0.042`. Recheck the TypeSafe model page before a large scan.
 
-The endpoint and model are already configured. No direct TypeSafe key, Vercel
-deployment/project ID, database credentials, or generator API key is needed for
-the initial retrieval study. Models and indexes run locally. Optional API
-comparators and the phase 8 generator will be configured when those models are
-selected.
+Then run:
 
-Vercel integration uses `POST /typesafe/v1/systemone` with bearer authentication
-and model `typesafe-ai/jev`, preserving the guide's Noul/Score/Choice contracts.
-The base URL excludes `/v1/systemone`; the adapter will append that path.
-Vercel recommends its generic evaluation API for new applications; the compatible
-API is chosen here to preserve the guide's documented schemas. Actual capability,
-usage, pricing, rate limits, and model revision behavior remain preflight gates.
+```bash
+./scripts/01_setup.sh
+.venv/bin/python -m jev_eval preflight
+./scripts/06_jev_scan.sh 1 5183 8000 30000000
+```
 
-As checked on 2026-09-22, Vercel lists promotional free pricing ending September 25,
-2026. Recheck pricing before live execution; do not infer permanent free access.
-The pilot contains 1,500 pair evaluations plus separately recorded preflight,
-retries, and repeats. Token/request limits will be frozen after preflight estimates.
+The direct preflight writes `manifests/capabilities_typesafe.json`. The scan uses
+the already prepared SciFact data under `runs/scifact_train_pilot_v1/`, but writes
+its own `jev_scan_typesafe_scores.json`, raw responses under `typesafe_scan/`, and
+`runs/budget_typesafe.sqlite`. The Vercel scores cannot be resumed as direct
+scores because the provider identity and resolved model version were not proven
+equivalent. The scan defaults to 12 workers and 10 request starts per second,
+adapting downward on 429 or 529 responses.
 
-Next: phase 0 repository/contracts and capabilities, then phase 1 evaluation,
-phase 2 retrieval, phase 3 Jev/local rerankers and pilot, phase 4 selection,
-phase 5 fusion, phase 6 calibration/statistics, and phases 7–8 extensions.
-Human calibration judgments and multilingual review must come from actual
-assessors; implementation alone cannot satisfy these experimental gates.
+TypeSafe currently publishes a ceiling of 1,200 requests per minute and 250,000
+tokens per second for Jev 1.13. It says those limits can change. The default
+scan rate is below the published request ceiling, but your account may receive
+different limits, so inspect 429 responses and the scan's rate adjustments.
 
-References:
+For fixed-pool Jev reranking or the decision benchmark through TypeSafe, use a
+new experiment ID so those outputs cannot be confused with the completed Vercel
+pilot. The direct scan's own output filenames already isolate its results.
 
-- [Gateway API keys](https://vercel.com/docs/ai-gateway/authentication-and-byok/api-keys)
-- [TypeSafe-compatible API](https://vercel.com/docs/ai-gateway/sdks-and-apis/typesafe)
-- [Jev model and pricing](https://vercel.com/ai-gateway/models/jev)
+References: [TypeSafe API](https://docs.typesafe.ai/api),
+[TypeSafe models and limits](https://docs.typesafe.ai/models).

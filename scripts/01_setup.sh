@@ -10,7 +10,7 @@ fi
 
 if [[ ! -f .env ]]; then
   cp .env.example .env
-  echo "Created .env from .env.example. Enter AI_GATEWAY_API_KEY and JEV_MAX_COST_USD, then rerun setup." >&2
+  echo "Created .env from .env.example. Enter TYPESAFE_API_KEY and confirm JEV_MAX_COST_USD, then rerun setup." >&2
   exit 1
 fi
 

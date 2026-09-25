@@ -7,7 +7,7 @@ from .ledger import now
 
 
 def run_preflight():
-    path = Path("runs/preflight_v1")
+    path = Path("runs/preflight_typesafe_v1")
     client = JevClient(Settings.load(), path)
     report = {
         "created_at": now(),
@@ -20,14 +20,14 @@ def run_preflight():
         "permitted_data_use": "public_synthetic_fixtures_only; benchmark terms review pending",
     }
     previous = (
-        read_json("manifests/capabilities.json")
-        if Path("manifests/capabilities.json").exists()
+        read_json("manifests/capabilities_typesafe.json")
+        if Path("manifests/capabilities_typesafe.json").exists()
         else {}
     )
 
     def save():
         report["budget"] = client.ledger.totals()
-        write_json("manifests/capabilities.json", report)
+        write_json("manifests/capabilities_typesafe.json", report)
 
     try:
         report["catalog_model"] = client.discover()
@@ -35,9 +35,7 @@ def run_preflight():
         report["model_discovery_http_status"] = models_response.status_code
         if models_response.status_code == 200:
             report["available_models"] = models_response.json()
-        report["immutable_revision"] = (
-            "not_exposed_by_alias; confirmatory_execution_remains_gated"
-        )
+        report["immutable_revision"] = "versioned_model_id_requested"
         save()
         question = {
             "type": "noul",

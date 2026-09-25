@@ -319,7 +319,7 @@ def rerank(config_path, system="qwen"):
             "system": system,
             "queries": queries,
             "rubric": rubric(config.task),
-            "gateway_model": settings.model if settings else None,
+            "jev_model": settings.model if settings else None,
             "adapter_sha256": file_digest(
                 Path(__file__).with_name("jev.py" if system == "jev" else "models.py")
             ),
@@ -329,16 +329,18 @@ def rerank(config_path, system="qwen"):
         raise ValueError("Score checkpoint provenance changed")
     saved["provenance"] = expected
     if system == "jev":
+        saved["api_source"] = "typesafe_direct"
+        saved["requested_model"] = settings.model
         from .jev import JevClient
 
-        capabilities = read_json("manifests/capabilities.json")
+        capabilities = read_json("manifests/capabilities_typesafe.json")
         if capabilities["status"] != "noul_functional_checks_passed":
             raise ValueError(
                 "Jev capability preflight must pass before benchmark requests"
             )
         if config.jev_revision and config.jev_revision != settings.model:
             raise ValueError(
-                "Configured Jev revision differs from the requested Gateway model"
+                "Configured Jev revision differs from the requested TypeSafe model"
             )
         client = JevClient(
             settings,

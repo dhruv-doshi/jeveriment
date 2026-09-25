@@ -15,7 +15,7 @@ from .rubrics import build_request
 
 
 class SharedRateLimiter:
-    """Pace all workers and make a 429 pause apply to the entire scan."""
+    """Pace all workers and make provider throttling pause the entire scan."""
 
     def __init__(self, requests_per_second):
         if requests_per_second <= 0:
@@ -48,7 +48,7 @@ class SharedRateLimiter:
             )
             self.condition.notify_all()
         print(
-            f"Jev 429: pausing workers for at least {retry_after:.1f}s; "
+            f"Jev throttled: pausing workers for at least {retry_after:.1f}s; "
             f"rate now {self.rate:.2f} requests/s",
             flush=True,
         )
@@ -64,7 +64,7 @@ class SharedRateLimiter:
 
 @contextmanager
 def scan_lock(dest):
-    path = dest / "jev_scan.lock"
+    path = dest / "jev_scan_typesafe.lock"
     with path.open("a+") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -82,8 +82,8 @@ def scan(
     approved_pairs,
     request_budget,
     token_budget,
-    workers=4,
-    requests_per_second=2.0,
+    workers=12,
+    requests_per_second=10.0,
 ):
     if not 1 <= workers <= 32:
         raise ValueError("workers must be between 1 and 32")
@@ -102,18 +102,19 @@ def scan(
         raise ValueError(f"Full scan requires --approve-pairs {pairs} exactly")
     if request_budget < pairs or token_budget < 1:
         raise ValueError("Explicit request/token budgets are insufficient")
-    capabilities = read_json("manifests/capabilities.json")
+    capabilities = read_json("manifests/capabilities_typesafe.json")
     if capabilities["status"] != "noul_functional_checks_passed":
         raise ValueError("Jev Noul preflight has not passed")
     settings = Settings.load()
     if config.jev_revision and config.jev_revision != settings.model:
         raise ValueError("Configured Jev revision differs from Gateway model")
-    path = dest / "jev_scan_scores.json"
+    path = dest / "jev_scan_typesafe_scores.json"
     identity = digest(
         {
             "queries": queries,
             "views": {d: views[d]["hash"] for d in ids},
             "config": config.model_dump(),
+            "source": "typesafe_direct",
             "model": settings.model,
             "mode": "independent_noul_full_corpus",
         }
@@ -124,8 +125,9 @@ def scan(
     if set(saved["scores"]) - set(selected):
         raise ValueError("Jev scan checkpoint contains unexpected queries")
     with scan_lock(dest):
+        client_dir = dest / "typesafe_scan"
         client = JevClient(
-            settings, dest, token_budget, request_budget, config.max_attempts
+            settings, client_dir, token_budget, request_budget, config.max_attempts
         )
         clients = []
         clients_lock = threading.Lock()
@@ -135,7 +137,7 @@ def scan(
             worker = getattr(local, "client", None)
             if worker is None:
                 worker = JevClient(
-                    settings, dest, token_budget, request_budget, config.max_attempts
+                    settings, client_dir, token_budget, request_budget, config.max_attempts
                 )
                 worker.rate_limiter = limiter
                 # Reuse the catalog fetched by the sentinel. Each thread owns its
@@ -237,7 +239,7 @@ def scan(
 
 def compare(config_path):
     config, dest = load_run(config_path)
-    saved = read_json(dest / "jev_scan_scores.json")
+    saved = read_json(dest / "jev_scan_typesafe_scores.json")
     views = read_json(dest / "text_views.json")
     ids = set(views)
     selected = list(saved["scores"])
@@ -251,6 +253,7 @@ def compare(config_path):
             "queries": queries,
             "views": {d: views[d]["hash"] for d in sorted(ids)},
             "config": config.model_dump(),
+            "source": "typesafe_direct",
             "model": Settings.load().model,
             "mode": "independent_noul_full_corpus",
         }
@@ -262,7 +265,7 @@ def compare(config_path):
     systems = {
         "bm25": sources["bm25"],
         "dense_cosine": sources["dense"],
-        "jev_full_scan": saved["scores"],
+        "jev_typesafe_full_scan": saved["scores"],
     }
     rows, summary = [], {}
     for name, runs in systems.items():
@@ -288,7 +291,7 @@ def compare(config_path):
                 for metric in ("ndcg@10", "recall@10", "mrr@10", "candidate_recall")
             },
         }
-        export_trec(dest / f"retrieval_{name}.trec", top_runs, name)
-    write_json(dest / "retrieval_per_query_metrics.json", rows)
-    write_json(dest / "retrieval_summary.json", summary)
+        export_trec(dest / f"retrieval_typesafe_{name}.trec", top_runs, name)
+    write_json(dest / "retrieval_typesafe_per_query_metrics.json", rows)
+    write_json(dest / "retrieval_typesafe_summary.json", summary)
     return summary

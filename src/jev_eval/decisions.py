@@ -20,6 +20,8 @@ def benchmark(config_path, threshold, request_budget, token_budget):
     qrels = read_json(dest / "qrels.json")
     if jev.get("status") != "complete":
         raise ValueError("Complete fixed-pool Jev scores are required")
+    if jev.get("api_source") != "typesafe_direct":
+        raise ValueError("Direct TypeSafe rerank scores are required")
     if set(jev["scores"]) != set(pools):
         raise ValueError("Jev scores do not cover every query")
     for pool in pools.values():
@@ -31,10 +33,12 @@ def benchmark(config_path, threshold, request_budget, token_budget):
             ):
                 raise ValueError("Candidate evidence differs from frozen text view")
     settings = Settings.load()
+    if jev.get("requested_model") != settings.model:
+        raise ValueError("Jev score model differs from direct TypeSafe model")
     if config.jev_revision and config.jev_revision != settings.model:
-        raise ValueError("Configured Jev revision differs from Gateway model")
+        raise ValueError("Configured Jev revision differs from TypeSafe model")
     if (
-        read_json("manifests/capabilities.json")["status"]
+        read_json("manifests/capabilities_typesafe.json")["status"]
         != "noul_functional_checks_passed"
     ):
         raise ValueError("Jev Noul preflight has not passed")

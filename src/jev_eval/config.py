@@ -13,33 +13,46 @@ from .contracts import Contract
 class Settings(Contract):
     api_key: SecretStr
     max_cost_usd: Decimal
-    base_url: str = "https://ai-gateway.vercel.sh/typesafe"
-    model: str = "typesafe-ai/jev"
+    base_url: str = "https://api.typesafe.ai"
+    model: str = "jev-1.13.0"
+    input_usd_per_million_tokens: Decimal = Decimal("0.042")
 
     @classmethod
     def load(cls):
         load_dotenv(Path.cwd() / ".env", override=False)
-        key = os.environ.get("AI_GATEWAY_API_KEY", "").strip()
+        key = os.environ.get("TYPESAFE_API_KEY", "").strip()
         if not key:
-            raise ValueError("AI_GATEWAY_API_KEY is missing")
+            raise ValueError("TYPESAFE_API_KEY is missing")
         try:
             budget = Decimal(os.environ.get("JEV_MAX_COST_USD", ""))
         except InvalidOperation:
             raise ValueError("JEV_MAX_COST_USD must be a nonnegative amount") from None
         if not budget.is_finite() or budget < 0:
             raise ValueError("JEV_MAX_COST_USD must be finite and nonnegative")
+        try:
+            input_price = Decimal(
+                os.environ.get("JEV_INPUT_USD_PER_MILLION_TOKENS", "0.042")
+            )
+        except InvalidOperation:
+            raise ValueError("Invalid Jev input-token price") from None
+        if not input_price.is_finite() or input_price < 0:
+            raise ValueError("Invalid Jev input-token price")
         base = os.environ.get(
             "JEV_API_BASE_URL", cls.model_fields["base_url"].default
         ).rstrip("/")
-        if base != "https://ai-gateway.vercel.sh/typesafe":
+        if base != "https://api.typesafe.ai":
             raise ValueError(
-                "This adapter only sends credentials to the configured Vercel host"
+                "This adapter only sends credentials to api.typesafe.ai"
             )
+        model = os.environ.get("JEV_MODEL", "jev-1.13.0").strip()
+        if not model:
+            raise ValueError("JEV_MODEL must be set to a TypeSafe model ID")
         return cls(
             api_key=key,
             max_cost_usd=budget,
             base_url=base,
-            model=os.environ.get("JEV_MODEL", "typesafe-ai/jev"),
+            model=model,
+            input_usd_per_million_tokens=input_price,
         )
 
 

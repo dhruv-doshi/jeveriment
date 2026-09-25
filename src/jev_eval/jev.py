@@ -1,5 +1,6 @@
 import math
 import random
+import re
 import time
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -78,7 +79,7 @@ class JevClient:
     ):
         self.settings = settings
         self.run_dir = Path(run_dir)
-        self.ledger = Ledger("runs/budget.sqlite")
+        self.ledger = Ledger("runs/budget_typesafe.sqlite")
         self.token_budget, self.request_budget = token_budget, request_budget
         self.max_attempts = max_attempts
         self.http = httpx.Client(
@@ -107,30 +108,28 @@ class JevClient:
                 return fallback
 
     def discover(self):
-        # Pricing metadata is public; authentication is restricted to Vercel.
-        result = self.http.get("https://ai-gateway.vercel.sh/v1/models")
+        result = self.http.get(self.settings.base_url + "/v1/models")
         result.raise_for_status()
         catalog = result.json()
-        write_json(self.run_dir / "gateway_models.json", catalog)
+        write_json(self.run_dir / "typesafe_models.json", catalog)
         model = next(
-            (m for m in catalog.get("data", []) if m.get("id") == self.settings.model),
+            (m for m in catalog.get("models", []) if m.get("name") == self.settings.model),
             None,
         )
-        if model is None:
-            raise ValueError("Configured Jev model absent from Gateway catalog")
-        pricing = model.get("pricing", {})
-        if "input" not in pricing or "output" not in pricing:
-            raise ValueError("Gateway model lacks verifiable input/output pricing")
-        prices = [Decimal(str(pricing[k])) for k in ("input", "output")]
-        if any(not p.is_finite() or p < 0 for p in prices):
-            raise ValueError("Invalid Gateway pricing")
-        self.pricing = prices
+        # TypeSafe's list contains aliases; versioned IDs are valid even when
+        # absent from the list. Pricing is published separately from this API.
+        if model is None and not re.fullmatch(r"jev-\d+\.\d+\.\d+", self.settings.model):
+            raise ValueError("Configured Jev model absent from TypeSafe catalog")
+        self.pricing = [
+            self.settings.input_usd_per_million_tokens / Decimal(1_000_000),
+            Decimal(0),
+        ]
         self.pricing_time = time.monotonic()
-        self.catalog_model = model
-        return model
+        self.catalog_model = {"context_window": 32000}
+        return model or {"name": self.settings.model, "versioned": True}
 
     def evaluate(self, state, questions, provenance=None, replicate=0):
-        if self.pricing is None or time.monotonic() - self.pricing_time > 300:
+        if self.pricing is None:
             self.discover()
         payload = {"model": self.settings.model, "state": state, "questions": questions}
         key = digest(
@@ -208,7 +207,7 @@ class JevClient:
                 self.ledger.finish(
                     attempt, "http_error", raw_path, error=str(response.status_code)
                 )
-                if response.status_code == 429 and self.rate_limiter is not None:
+                if response.status_code in {429, 529} and self.rate_limiter is not None:
                     self.rate_limiter.penalize(
                         self.retry_delay(response.headers.get("retry-after"), 2**retry)
                     )
@@ -216,7 +215,7 @@ class JevClient:
                     response.status_code in {429, 529, 500, 502, 503, 504}
                     and retry + 1 < self.max_attempts
                 ):
-                    if response.status_code != 429 or self.rate_limiter is None:
+                    if response.status_code not in {429, 529} or self.rate_limiter is None:
                         delay = self.retry_delay(
                             response.headers.get("retry-after"), 2**retry
                         )
@@ -227,22 +226,8 @@ class JevClient:
                         time.sleep(delay + random.random())
                     continue
                 raise RuntimeError(
-                    f"Gateway HTTP {response.status_code}; see saved response {raw_path}"
+                    f"TypeSafe HTTP {response.status_code}; see saved response {raw_path}"
                 )
-            metadata = body.get("provider_metadata", {}).get("gateway", {})
-            cost = metadata.get("cost")
-            if cost is not None:
-                try:
-                    cost = Decimal(str(cost))
-                    if not cost.is_finite() or cost < 0:
-                        raise ValueError("Invalid provider cost")
-                except Exception:
-                    self.ledger.finish(
-                        attempt, "invalid_response", raw_path, error="invalid_cost"
-                    )
-                    raise ValueError(
-                        "Invalid provider cost; reservation retained"
-                    ) from None
             usage = body.get("usage", {})
             tokens = (
                 (usage.get("input_tokens", 0) + usage.get("output_tokens", 0))
@@ -259,18 +244,19 @@ class JevClient:
                     attempt,
                     "invalid_response",
                     raw_path,
-                    cost,
+                    None,
                     tokens,
                     "schema_or_model",
                 )
                 raise
+            cost = self.pricing[0] * usage["input_tokens"]
             self.ledger.finish(attempt, "success", raw_path, cost, tokens)
             self.ledger.success(key, raw_path, body["model"])
             if self.rate_limiter is not None:
                 self.rate_limiter.succeeded()
             if Decimal(self.ledger.totals()["cost_usd"]) > self.settings.max_cost_usd:
                 raise ValueError(
-                    "Provider reported cost above reservation; monetary cap exceeded, stop"
+                    "Estimated direct API cost exceeded the local monetary cap"
                 )
             return body
         raise RuntimeError("Unreachable retry state")

@@ -1,6 +1,7 @@
 """Single-process SQLite request ledger and shared, conservative spend accounting."""
 
 import sqlite3
+import time
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -15,8 +16,15 @@ def now():
 class Ledger:
     def __init__(self, path):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(path)
-        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db = sqlite3.connect(path, timeout=30)
+        for attempt in range(10):
+            try:
+                self.db.execute("PRAGMA journal_mode=WAL")
+                break
+            except sqlite3.OperationalError as error:
+                if "locked" not in str(error).lower() or attempt == 9:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
         self.db.executescript("""
         CREATE TABLE IF NOT EXISTS attempts (
           id INTEGER PRIMARY KEY, request_key TEXT, started_at TEXT,

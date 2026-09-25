@@ -143,9 +143,10 @@ def test_full_synthetic_pipeline_resume_and_failure_reporting(tmp_path, monkeypa
     )
     (tmp_path / "manifests").mkdir()
     write_json(
-        tmp_path / "manifests" / "capabilities.json",
+        tmp_path / "manifests" / "capabilities_typesafe.json",
         {"status": "noul_functional_checks_passed"},
     )
+    write_json(dest / "jev_scan_scores.json", {"vercel_checkpoint": True})
     with pytest.raises(ValueError, match="approve-pairs 40"):
         scan.scan(config_path, 2, 39, 100, 100000)
     assert FixtureJev.calls == 0
@@ -155,9 +156,11 @@ def test_full_synthetic_pipeline_resume_and_failure_reporting(tmp_path, monkeypa
     assert FixtureJev.max_active > 1
     assert scan.scan(config_path, 3, 60, 100, 100000)["pairs"] == 60
     assert FixtureJev.calls == 60
+    assert read_json(dest / "jev_scan_scores.json") == {"vercel_checkpoint": True}
     comparison = scan.compare(config_path)
-    assert comparison["jev_full_scan"]["eligible_queries"] == 3
+    assert comparison["jev_typesafe_full_scan"]["eligible_queries"] == 3
     assert comparison["dense_cosine"]["eligible_queries"] == 3
+    assert (dest / "retrieval_typesafe_summary.json").exists()
     pools = read_json(dest / "pools.json")
     from jev_eval import decisions
 
@@ -179,6 +182,8 @@ def test_full_synthetic_pipeline_resume_and_failure_reporting(tmp_path, monkeypa
         dest / "scores_jev.json",
         {
             "status": "complete",
+            "api_source": "typesafe_direct",
+            "requested_model": "jev",
             "scores": {
                 q: {
                     c["doc_id"]: (0.9 if int(c["doc_id"]) < 5 else 0.1)

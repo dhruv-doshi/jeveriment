@@ -7,6 +7,31 @@ from jev_eval.config import Settings
 from jev_eval.jev import JevClient
 
 
+def test_direct_settings_use_typesafe_key_and_host(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    for name in (
+        "TYPESAFE_API_KEY",
+        "AI_GATEWAY_API_KEY",
+        "JEV_MODEL",
+        "JEV_API_BASE_URL",
+        "JEV_MAX_COST_USD",
+        "JEV_INPUT_USD_PER_MILLION_TOKENS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    (tmp_path / ".env").write_text(
+        "TYPESAFE_API_KEY=direct-fixture\n"
+        "JEV_MODEL=jev-1.13.0\n"
+        "JEV_MAX_COST_USD=1\n"
+    )
+    settings = Settings.load()
+    assert settings.base_url == "https://api.typesafe.ai"
+    assert settings.model == "jev-1.13.0"
+    assert settings.api_key.get_secret_value() == "direct-fixture"
+    monkeypatch.setenv("JEV_API_BASE_URL", "https://ai-gateway.vercel.sh/typesafe")
+    with pytest.raises(ValueError, match="api.typesafe.ai"):
+        Settings.load()
+
+
 def fixture_client(tmp_path, monkeypatch, responses):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr("jev_eval.jev.time.sleep", lambda _: None)
@@ -23,11 +48,9 @@ def fixture_client(tmp_path, monkeypatch, responses):
             return httpx.Response(
                 200,
                 json={
-                    "data": [
+                    "models": [
                         {
-                            "id": "typesafe-ai/jev",
-                            "context_window": 32000,
-                            "pricing": {"input": "0.000000042", "output": "0"},
+                            "name": "jev-latest",
                         }
                     ]
                 },
@@ -40,12 +63,11 @@ def fixture_client(tmp_path, monkeypatch, responses):
     return client, calls
 
 
-def response(value=0.8, model="jev-fixture"):
+def response(value=0.8, model="jev-1.13.0"):
     return {
         "model": model,
         "answers": {"r": {"type": "noul", "noul": value}},
         "usage": {"input_tokens": 10, "output_tokens": 1},
-        "provider_metadata": {"gateway": {"cost": "0.00000042"}},
     }
 
 
@@ -56,6 +78,7 @@ def test_success_resume_and_no_retry_low_probability(tmp_path, monkeypatch):
     second = client.evaluate("text", question)
     assert first == second and len(calls) == 2
     assert client.ledger.totals()["attempts"] == 1
+    assert Decimal(client.ledger.totals()["reported_cost_usd"]) == Decimal("0.00000042")
     assert len(list((tmp_path / "run" / "raw").glob("*.json"))) == 1
     assert (
         "synthetic-not-a-real-key"
@@ -110,11 +133,7 @@ def test_rate_limit_pauses_shared_limiter_before_retry(tmp_path, monkeypatch):
             return httpx.Response(
                 200,
                 json={
-                    "data": [{
-                        "id": "typesafe-ai/jev",
-                        "context_window": 32000,
-                        "pricing": {"input": "0.000000042", "output": "0"},
-                    }]
+                    "models": [{"name": "jev-latest"}]
                 },
             )
         if len([r for r in calls if r.method == "POST"]) == 1:

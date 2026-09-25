@@ -10,5 +10,6 @@ data
 indices/
 embeddings/
 runs
+manifests/capabilities_typesafe.json
 reports/
 .DS_Store

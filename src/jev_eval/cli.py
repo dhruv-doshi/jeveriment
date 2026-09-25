@@ -17,8 +17,8 @@ def main():
     scan.add_argument("--approve-pairs", type=int, required=True)
     scan.add_argument("--request-budget", type=int, required=True)
     scan.add_argument("--token-budget", type=int, required=True)
-    scan.add_argument("--workers", type=int, default=4)
-    scan.add_argument("--requests-per-second", type=float, default=2.0)
+    scan.add_argument("--workers", type=int, default=12)
+    scan.add_argument("--requests-per-second", type=float, default=10.0)
     comparison = sub.add_parser("compare-retrieval")
     comparison.add_argument("config")
     decisions = sub.add_parser("benchmark-decisions")
@@ -101,7 +101,7 @@ def main():
         from .scan import scan
 
         with ResourceMonitor(
-            run_dir(load_config(args.config)) / "resources_jev_scan.json"
+            run_dir(load_config(args.config)) / "resources_jev_scan_typesafe.json"
         ):
             print(
                 json.dumps(

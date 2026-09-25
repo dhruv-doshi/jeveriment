@@ -10,6 +10,6 @@ if [[ $# -lt 4 ]]; then
   exit 2
 fi
 
-run_logged jev_scan .venv/bin/python -m jev_eval jev-scan "$CONFIG" \
+run_logged jev_scan_typesafe .venv/bin/python -m jev_eval jev-scan "$CONFIG" \
   --queries "$1" --approve-pairs "$2" --request-budget "$3" --token-budget "$4" "${@:5}"
-run_logged compare_retrieval .venv/bin/python -m jev_eval compare-retrieval "$CONFIG"
+run_logged compare_retrieval_typesafe .venv/bin/python -m jev_eval compare-retrieval "$CONFIG"
