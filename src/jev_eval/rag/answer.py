@@ -65,7 +65,8 @@ def generate_answer(query: QueryRecord, context: ContextSelection, client: Budge
         "model": model,
         "messages": messages,
         "temperature": 0,
-        "max_tokens": max_output_tokens,
+        "max_completion_tokens": max_output_tokens,
+        "reasoning": {"enabled": False},
         "response_format": {
             "type": "json_schema",
             "json_schema": {"name": "rag_answer", "strict": True,
@@ -87,8 +88,20 @@ def generate_answer(query: QueryRecord, context: ContextSelection, client: Budge
         raise ValueError("Generator cited a chunk outside selected context")
     usage = {key: value for key, value in body.get("usage", {}).items() if type(value) is int}
     metadata = client.generation_metadata(body["id"], reply.attempt_id) if body.get("id") else None
+    billed_cost = metadata.get("total_cost") if metadata else None
+    if billed_cost is None:
+        billed_cost = body.get("usage", {}).get("cost")
     return GenerationResult(query_id=query.query_id, model_requested=model,
                             model_resolved=body["model"], answer=parsed["answer"],
                             citations=tuple(parsed["citations"]), usage=usage,
                             provider_generation_id=body.get("id"), raw_response_hash=digest(body),
+                            raw_response_path=reply.raw_path,
+                            provider_name=(metadata or {}).get("provider_name") or body.get("provider"),
+                            provider_backend_model=(metadata or {}).get("model"),
+                            api_latency_ms=None if reply.cache_hit else reply.elapsed_ms,
+                            queue_wait_ms=None if reply.cache_hit else reply.queue_wait_ms,
+                            cache_hit=reply.cache_hit,
+                            provider_reported_latency_ms=(metadata or {}).get("latency"),
+                            provider_reported_generation_time_ms=(metadata or {}).get("generation_time"),
+                            billed_cost_usd=str(billed_cost) if billed_cost is not None else None,
                             provider_metadata_hash=digest(metadata) if metadata else None)

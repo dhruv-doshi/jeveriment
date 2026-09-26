@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 from jev_eval.rag.answer import generate_answer, pack_context
-from jev_eval.rag.clients import BudgetedHTTP
+from jev_eval.rag.clients import BudgetedHTTP, validate_openrouter
 from jev_eval.rag.contracts import GoldRecord, QueryRecord
 from jev_eval.rag.datasets import adapter_for
 from jev_eval.rag.evaluation import evaluate_answer, evaluate_ranking
@@ -45,7 +45,10 @@ def test_five_official_shape_adapters(tmp_path):
     for dataset, cid in expected.items():
         adapter = adapter_for(dataset, root)
         assert adapter.audit()["ready"]
-        assert [chunk.chunk_id for chunk in adapter.iter_chunks()] == [cid]
+        chunk_ids = [chunk.chunk_id for chunk in adapter.iter_chunks()]
+        assert cid in chunk_ids
+        if dataset != "qasper":
+            assert chunk_ids == [cid]
         query, gold = next(adapter.iter_queries())
         assert query.text and gold.query_id == query.query_id
         if dataset == "mirage":
@@ -176,12 +179,55 @@ def test_budgeted_generator_records_request_and_checks_citations(tmp_path):
     result = generate_answer(query, context, client, "moonshotai/kimi-k2.5", "fixture-provider")
     assert result.answer == "A" and result.citations == ("c1",)
     assert result.provider_metadata_hash
+    assert result.provider_name == "fixture-provider"
+    assert result.provider_reported_generation_time_ms == 1200
+    assert result.raw_response_path and result.api_latency_ms is not None
     assert seen[0]["provider"]["allow_fallbacks"] is False
+    assert seen[0]["max_completion_tokens"] == 768
+    assert seen[0]["reasoning"] == {"enabled": False}
     assert "Options:" in seen[0]["messages"][1]["content"]
     assert "test-secret" not in "".join(p.read_text() for p in (tmp_path / "run/raw").rglob("*.json"))
     gold = GoldRecord(dataset_id="mirage", query_id="q", answers=("A",))
     assert evaluate_answer(result, gold, context)["answer_exact_match"] == 1
     assert client.ledger_path.exists()
+
+
+def test_openrouter_usage_above_reservation_stops_and_records_charge(tmp_path):
+    def respond(_request):
+        return httpx.Response(200, json={
+            "model": "moonshotai/kimi-k2.5",
+            "choices": [{"message": {"content": '{"answer":"Blue","citations":[]}'}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 300, "cost": 0.0006795},
+        })
+
+    client = BudgetedHTTP(provider="openrouter", root=tmp_path, token="test-secret",
+                          base_url="https://openrouter.ai/api/v1", budget_usd=Decimal("1"),
+                          max_tokens=10000, max_requests=10,
+                          input_usd_per_million=Decimal("0.45"), output_usd_per_million=Decimal("2.25"),
+                          rpm=100, tpm=10000, inflight=1, transport=httpx.MockTransport(respond))
+    with pytest.raises(ValueError, match="exceeded reserved token bound"):
+        client.post("/chat/completions", {"model": "moonshotai/kimi-k2.5"},
+                    max_input_tokens=100, max_output_tokens=128, validate=validate_openrouter)
+    assert Decimal(client._ledger().totals()["cost_usd"]) == Decimal("0.0006795")
+
+
+def test_openrouter_generation_metadata_retries_eventual_404(tmp_path, monkeypatch):
+    calls = []
+
+    def respond(_request):
+        calls.append(1)
+        return (httpx.Response(404, json={"error": "not found"}) if len(calls) == 1
+                else httpx.Response(200, json={"data": {"id": "g1", "provider_name": "fixture-provider"}}))
+
+    monkeypatch.setattr("jev_eval.rag.clients.time.sleep", lambda _seconds: None)
+    client = BudgetedHTTP(provider="openrouter", root=tmp_path, token="test-secret",
+                          base_url="https://openrouter.ai/api/v1", budget_usd=Decimal("1"),
+                          max_tokens=10000, max_requests=10,
+                          input_usd_per_million=Decimal("0.45"), output_usd_per_million=Decimal("2.25"),
+                          rpm=100, tpm=10000, inflight=1, transport=httpx.MockTransport(respond))
+    assert client.generation_metadata("g1", None)["provider_name"] == "fixture-provider"
+    assert client.generation_metadata("g1", None)["provider_name"] == "fixture-provider"
+    assert len(calls) == 2
 
 
 def test_optional_judge_is_metered_and_replayable(tmp_path):

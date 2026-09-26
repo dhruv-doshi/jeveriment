@@ -98,8 +98,11 @@ class BudgetedHTTP:
         self.budget_usd, self.max_tokens, self.max_requests = budget_usd, max_tokens, max_requests
         self.input_price = input_usd_per_million / Decimal(1_000_000)
         self.output_price = output_usd_per_million / Decimal(1_000_000)
+        headers = {"Authorization": f"Bearer {token}"}
+        if provider == "openrouter":
+            headers["X-OpenRouter-Metadata"] = "enabled"
         self.http = httpx.Client(base_url=base_url, timeout=60, transport=transport,
-                                 headers={"Authorization": f"Bearer {token}"}, follow_redirects=False)
+                                 headers=headers, follow_redirects=False)
         self._local = threading.local()
 
     def _ledger(self):
@@ -142,7 +145,10 @@ class BudgetedHTTP:
                                           "status_code": response.status_code, "elapsed_ms": elapsed,
                                           "queue_wait_ms": queue_wait_ms,
                                           "timestamp": now(), "request_id": response.headers.get("x-request-id"),
-                                          "server_timing": response.headers.get("server-timing")})
+                                          "server_timing": response.headers.get("server-timing"),
+                                          "rate_headers": {key: value for key, value in response.headers.items()
+                                                           if key.lower().startswith(("x-ratelimit", "ratelimit"))
+                                                           or key.lower() == "retry-after"}})
                 except httpx.TransportError as exc:
                     elapsed = (time.monotonic() - started) * 1000
                     write_json(raw_path, {"request": payload, "provenance": provenance, "error": type(exc).__name__,
@@ -175,7 +181,13 @@ class BudgetedHTTP:
                 if type(input_tokens) is not int or type(output_tokens) is not int:
                     ledger.finish(attempt_id, "missing_usage", raw_path, error="missing_usage")
                     raise ValueError("Provider response missing billed token usage")
-                cost = self.input_price * input_tokens + self.output_price * output_tokens
+                reported_cost = usage.get("cost") if self.provider == "openrouter" else None
+                cost = (Decimal(str(reported_cost)) if type(reported_cost) in (int, float)
+                        else self.input_price * input_tokens + self.output_price * output_tokens)
+                if input_tokens > max_input_tokens or output_tokens > max_output_tokens:
+                    ledger.finish(attempt_id, "usage_exceeded_reservation", raw_path, cost=cost,
+                                  tokens=input_tokens + output_tokens, error="usage_exceeded_reservation")
+                    raise ValueError("Provider usage exceeded reserved token bound; stop run")
                 ledger.finish(attempt_id, "success", raw_path, cost=cost, tokens=input_tokens + output_tokens)
                 ledger.success(request_key, raw_path, body.get("model", "unknown"))
                 self.gate.succeeded()
@@ -190,39 +202,49 @@ class BudgetedHTTP:
     def generation_metadata(self, generation_id: str, attempt_id: int | None):
         if self.provider != "openrouter":
             raise ValueError("Generation metadata is only available for OpenRouter")
-        path = self.root / "raw" / "openrouter_metadata" / f"{generation_id}.json"
-        if path.exists():
-            return json.loads(path.read_text()).get("response")
-        lease = self.gate.acquire(0)
-        try:
-            ledger = self._ledger()
-            meta_attempt = ledger.reserve(digest({"metadata": generation_id}), Decimal(0), 0,
-                                          self.budget_usd, self.max_tokens, self.max_requests)
-            started = time.monotonic()
+        directory = self.root / "raw" / "openrouter_metadata"
+        for path in sorted(directory.glob(f"{generation_id}*.json")):
+            record = json.loads(path.read_text())
+            if record.get("status_code") == 200 and isinstance(record.get("response", {}).get("data"), dict):
+                return record["response"]["data"]
+        # OpenRouter's generation record can lag the completion response by seconds.
+        for retry in range(3):
+            if retry:
+                time.sleep(retry)
+            lease = self.gate.acquire(0)
             try:
-                response = self.http.get("/generation", params={"id": generation_id})
-                body = response.json()
-                status = response.status_code
-            except (httpx.TransportError, ValueError) as exc:
-                body, status = {"error": type(exc).__name__}, 0
-            write_json(path, {"response": body, "status_code": status,
-                              "elapsed_ms": (time.monotonic() - started) * 1000, "timestamp": now()})
-            ledger.finish(meta_attempt, "success" if status == 200 else "metadata_error", path,
-                          cost=Decimal(0), tokens=0, error=None if status == 200 else str(status))
-            data = body.get("data") if status == 200 else None
-            if data and attempt_id is not None and isinstance(data.get("total_cost"), (int, float)):
-                original_path = self.root / "raw" / "openrouter"
-                match = next(original_path.glob(f"{attempt_id:08d}-*.json"), None)
-                if match:
-                    old = json.loads(match.read_text())
-                    usage = old.get("response", {}).get("usage", {})
-                    tokens = usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
-                    ledger.finish(attempt_id, "success", match, cost=Decimal(str(data["total_cost"])), tokens=tokens)
-                    if Decimal(ledger.totals()["cost_usd"]) > self.budget_usd:
-                        raise ValueError("Provider billed cost exceeded reserved global cap; stop run")
-            return data
-        finally:
-            self.gate.release(lease)
+                ledger = self._ledger()
+                meta_attempt = ledger.reserve(digest({"metadata": generation_id, "retry": retry}),
+                                              Decimal(0), 0, self.budget_usd,
+                                              self.max_tokens, self.max_requests)
+                path = directory / f"{generation_id}-{meta_attempt:08d}.json"
+                started = time.monotonic()
+                try:
+                    response = self.http.get("/generation", params={"id": generation_id})
+                    body = response.json()
+                    status = response.status_code
+                except (httpx.TransportError, ValueError) as exc:
+                    body, status = {"error": type(exc).__name__}, 0
+                write_json(path, {"response": body, "status_code": status,
+                                  "elapsed_ms": (time.monotonic() - started) * 1000, "timestamp": now()})
+                ledger.finish(meta_attempt, "success" if status == 200 else "metadata_error", path,
+                              cost=Decimal(0), tokens=0, error=None if status == 200 else str(status))
+                data = body.get("data") if status == 200 else None
+                if data and attempt_id is not None and isinstance(data.get("total_cost"), (int, float)):
+                    original_path = self.root / "raw" / "openrouter"
+                    match = next(original_path.glob(f"{attempt_id:08d}-*.json"), None)
+                    if match:
+                        old = json.loads(match.read_text())
+                        usage = old.get("response", {}).get("usage", {})
+                        tokens = usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
+                        ledger.finish(attempt_id, "success", match, cost=Decimal(str(data["total_cost"])), tokens=tokens)
+                        if Decimal(ledger.totals()["cost_usd"]) > self.budget_usd:
+                            raise ValueError("Provider billed cost exceeded reserved global cap; stop run")
+                if data is not None or status != 404:
+                    return data
+            finally:
+                self.gate.release(lease)
+        return None
 
 
 def validate_jev(body):

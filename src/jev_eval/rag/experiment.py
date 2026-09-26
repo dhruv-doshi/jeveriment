@@ -241,7 +241,8 @@ class ExperimentRuntime:
         generation_value, generation_record, generation_cached = execute_stage(
             self.store, run_id=self.spec.experiment_id, stage="generation", plugin_id=self.spec.generator.model,
             config={"model": self.spec.generator.model, "provider_only": self.provider_only,
-                    "max_output_tokens": self.spec.generator.max_output_tokens},
+                    "max_output_tokens": self.spec.generator.max_output_tokens,
+                    "completion_limit": "max_completion_tokens", "reasoning_enabled": False},
             upstream_hashes=(context_record.output_hash,),
             input_value={"query": query.model_dump(), "context": context.model_dump()},
             call=lambda _: generate_answer(query, context, self._client("openrouter"), self.spec.generator.model,

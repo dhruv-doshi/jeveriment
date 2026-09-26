@@ -8,7 +8,7 @@
 
 **Scope:** five existing benchmarks, pluggable retrieval and reranking, fixed primary generation comparisons, quality and operational evaluation
 
-**Execution state:** the pipeline and local fixture tests are implemented. Official source snapshots, local model weights, account-specific limits, and live provider preflight are not yet verified. The complete five-dataset evaluation and live-provider load test require a later explicit instruction from the owner; neither has begun.
+**Execution state:** the pipeline and local fixture tests are implemented. The smaller pinned official files are audited; MIRAGE and QASPER prepare from real sources with zero missing indexed evidence IDs, while CLERC/HotpotQA/KILT full-corpus joins wait for the VM. All four pinned local models and one synthetic TypeSafe and OpenRouter request have passed preflight. Account-specific RPM/TPM remain unknown; the observed OpenRouter key has a $10 spending limit, below this plan's $50 local cap. [Development report](DEVELOPMENT_REPORT.md) and [source audit](SOURCE_AUDIT.md) distinguish completed gates from pending work. The complete five-dataset evaluation and live-provider load test require a later explicit instruction from the owner; neither has begun.
 
 ## 1. Purpose and claim boundary
 
@@ -259,7 +259,7 @@ Capture operating system, Python/dependency lock, CUDA/MPS/CPU device, GPU type,
 
 ## 13. Implementation sequence and exit gates
 
-This is the build and verification order. The code path through all eight milestones exists on `feature/production-rag`, including parallel query execution, a dry-run matrix command, replay, reports, service, and local fault injection. Development fixtures cover the adapters and main contracts. The source audits, real corpus joins, local model weight smoke tests, live provider preflight, and full experiment are still pending; fixture passes are not paper results. A milestone is complete only when its exit gate passes.
+This is the build and verification order. The code path through all eight milestones exists on `feature/production-rag`, including parallel query execution, a dry-run matrix command, replay, reports, service, and local fault injection. Development fixtures cover the adapters and main contracts. The smaller source audit, MIRAGE/QASPER real joins, pinned-model CPU smoke tests, and synthetic live-provider preflights are complete. The three large corpus joins, account rate verification, GPU/load checks, and full experiment are pending; fixture and preflight passes are not paper results. A milestone is complete only when its exit gate passes.
 
 | Milestone | Build | Exit gate / evidence |
 |---|---|---|

@@ -6,15 +6,18 @@ max_saved_depth: 200
 datasets:
   - id: mirage
     source: https://github.com/gzxiong/MIRAGE
+    revision: 392943af99cd94cafd50a0de2e7fca24bbf65494
     task: medical_multiple_choice
   - id: clerc
     source: https://huggingface.co/datasets/jhu-clsp/CLERC
+    revision: ef042f8ab436f78704f17faa0a866d1b2b862f6f
     task: legal_retrieval_generation
   - id: hotpotqa
     source: https://hotpotqa.github.io/
     task: multi_hop_question_answering
   - id: qasper
     source: https://huggingface.co/datasets/allenai/qasper
+    revision: 16ac8fdf81e7e3ad213ead4b60fdcc9dc8ca40e9
     task: scientific_paper_question_answering
   - id: kilt_fever
     source: https://huggingface.co/datasets/facebook/kilt_tasks

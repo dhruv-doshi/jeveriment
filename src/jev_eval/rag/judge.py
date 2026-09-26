@@ -36,7 +36,8 @@ def judge_answer(query: QueryRecord, context: ContextSelection, answer: Generati
                                                     "reference_answers": gold.answers}, ensure_ascii=False)},
         ],
         "temperature": 0,
-        "max_tokens": 256,
+        "max_completion_tokens": 768,
+        "reasoning": {"enabled": False},
         "response_format": {"type": "json_schema", "json_schema": {"name": "rag_judge", "strict": True,
             "schema": {"type": "object", "additionalProperties": False,
                        "properties": {"faithfulness": {"type": "number"},
@@ -58,11 +59,21 @@ def judge_answer(query: QueryRecord, context: ContextSelection, answer: Generati
 
     reply = client.post("/chat/completions", payload,
                         max_input_tokens=len(json.dumps(payload, ensure_ascii=False).encode()),
-                        max_output_tokens=256, validate=validate,
+                        max_output_tokens=768, validate=validate,
                         provenance={"query_id": query.query_id, "dataset_id": query.dataset_id, "role": "judge"})
     body = reply.body
     value = json.loads(body["choices"][0]["message"]["content"])
     metadata = client.generation_metadata(body["id"], reply.attempt_id) if body.get("id") else None
+    billed_cost = metadata.get("total_cost") if metadata else None
+    if billed_cost is None:
+        billed_cost = body.get("usage", {}).get("cost")
     return JudgeResult(query_id=query.query_id, model_requested=model,
                        model_resolved=body["model"], raw_response_hash=digest(body),
+                       raw_response_path=reply.raw_path,
+                       provider_name=(metadata or {}).get("provider_name") or body.get("provider"),
+                       provider_backend_model=(metadata or {}).get("model"),
+                       api_latency_ms=None if reply.cache_hit else reply.elapsed_ms,
+                       queue_wait_ms=None if reply.cache_hit else reply.queue_wait_ms,
+                       cache_hit=reply.cache_hit,
+                       billed_cost_usd=str(billed_cost) if billed_cost is not None else None,
                        provider_metadata_hash=digest(metadata) if metadata else None, **value)

@@ -140,6 +140,15 @@ class GenerationResult(StrictModel):
     usage: dict[str, int] = Field(default_factory=dict)
     provider_generation_id: str | None = None
     provider_timing_ms: float | None = None
+    provider_name: str | None = None
+    provider_backend_model: str | None = None
+    api_latency_ms: float | None = None
+    queue_wait_ms: float | None = None
+    cache_hit: bool = False
+    raw_response_path: str | None = None
+    provider_reported_latency_ms: float | None = None
+    provider_reported_generation_time_ms: float | None = None
+    billed_cost_usd: str | None = None
     provider_metadata_hash: str | None = None
     raw_response_hash: str
 
@@ -153,4 +162,11 @@ class JudgeResult(StrictModel):
     answer_correctness: float | None = Field(default=None, ge=0, le=1)
     rationale: str
     raw_response_hash: str
+    raw_response_path: str | None = None
+    provider_name: str | None = None
+    provider_backend_model: str | None = None
+    api_latency_ms: float | None = None
+    queue_wait_ms: float | None = None
+    cache_hit: bool = False
+    billed_cost_usd: str | None = None
     provider_metadata_hash: str | None = None

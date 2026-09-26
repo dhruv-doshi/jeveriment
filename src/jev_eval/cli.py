@@ -150,6 +150,7 @@ def main() -> None:
             "max_jev_calls": args.limit * experiment.candidate_depth * len(datasets) * len(retrievers) if "jev" in rerankers else 0,
             "max_generation_calls": args.limit * cells if args.generate else 0,
             "max_judge_calls": args.limit * cells if args.judge else 0,
+            "max_openrouter_metadata_gets": 3 * args.limit * cells * (int(args.generate) + int(args.judge)),
             "budget_usd": str(experiment.budget_usd), "execution": "live" if args.execute else "dry_run",
         }
         if not args.execute:
@@ -173,7 +174,7 @@ def main() -> None:
         for provider, calls, input_bound, output_bound in (
             ("typesafe", forecast["max_jev_calls"], 32000, 64),
             ("openrouter", forecast["max_generation_calls"], 20000, experiment.generator.max_output_tokens),
-            ("openrouter", forecast["max_judge_calls"], 20000, 256),
+            ("openrouter", forecast["max_judge_calls"], 20000, 768),
         ):
             if calls:
                 item = limits[provider]

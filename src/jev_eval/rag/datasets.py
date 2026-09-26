@@ -237,11 +237,10 @@ class Qasper(DatasetAdapter):
     def iter_chunks(self):
         for paper in self._papers():
             paper_id = paper["id"]
-            for section_index, section in enumerate(_rows(paper["full_text"])):
-                for paragraph_index, paragraph in enumerate(section["paragraphs"]):
-                    chunk = _chunk(self.id, paper_id, f"{section_index}:{paragraph_index}", paragraph, title=section.get("section_name"), scope=paper_id)
-                    if chunk:
-                        yield chunk
+            for unit, text, title in self._paper_units(paper):
+                chunk = _chunk(self.id, paper_id, unit, text, title=title, scope=paper_id)
+                if chunk:
+                    yield chunk
 
     def iter_queries(self):
         for paper in self._papers():
@@ -250,7 +249,7 @@ class Qasper(DatasetAdapter):
             split = {"train": "development", "validation": "reporting", "test": "heldout"}.get(
                 source_split, _split(paper_id)
             )
-            paragraphs = list(self._paper_paragraphs(paper))
+            units = list(self._paper_units(paper))
             for qa in _rows(paper["qas"]):
                 qid = qa["question_id"]
                 answers = []
@@ -266,7 +265,14 @@ class Qasper(DatasetAdapter):
                     else:
                         answers.append("yes" if answer.get("yes_no") else "no")
                     for evidence in answer.get("evidence") or []:
-                        matches = [cid for cid, text in paragraphs if evidence.strip() and evidence.strip() in text]
+                        normalized = " ".join(evidence.split()).casefold()
+                        if normalized.startswith("float selected: "):
+                            normalized = normalized[len("float selected: "):]
+                            eligible = (item for item in units if item[0].startswith("float:"))
+                        else:
+                            eligible = iter(units)
+                        matches = [f"{paper_id}:{unit}" for unit, text, _ in eligible
+                                   if normalized and normalized in " ".join(text.split()).casefold()]
                         if not matches:
                             raise ValueError(f"QASPER evidence does not map to paper {paper_id}")
                         qrels.update({cid: 1 for cid in matches})
@@ -276,10 +282,18 @@ class Qasper(DatasetAdapter):
                 )
 
     @staticmethod
-    def _paper_paragraphs(paper):
+    def _paper_units(paper):
         for section_index, section in enumerate(_rows(paper["full_text"])):
+            heading = section.get("section_name") or ""
+            if heading.strip():
+                yield f"{section_index}:heading", heading, heading
             for paragraph_index, paragraph in enumerate(section["paragraphs"]):
-                yield f"{paper['id']}:{section_index}:{paragraph_index}", paragraph
+                if paragraph.strip():
+                    yield f"{section_index}:{paragraph_index}", paragraph, heading
+        for index, item in enumerate(_rows(paper.get("figures_and_tables") or [])):
+            caption = item.get("caption") or ""
+            if caption.strip():
+                yield f"float:{index}", caption, None
 
 
 class KiltFever(DatasetAdapter):
