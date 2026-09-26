@@ -1,12 +1,14 @@
 # JEV in production-style RAG: implementation plan
 
-**Status:** implementation plan; no code in this branch yet
+**Status:** complete implementation plan; code and experiment pending
 
 **Updated:** 2026-09-26
 
 **Branch:** `plan/production-rag`
 
 **Scope:** five existing benchmarks, pluggable retrieval and reranking, fixed primary generation comparisons, quality and operational evaluation
+
+**Execution state:** plan only. Development may begin after the owner asks to proceed; the complete five-dataset evaluation and live-provider load test require a later explicit instruction from the owner. No implementation or experiment has begun in this branch.
 
 ## 1. Purpose and claim boundary
 
@@ -99,12 +101,26 @@ The five are chosen now. They cover medicine, law, multi-hop Wikipedia QA, scien
 | Dataset and official source | Primary task and corpus | Native evaluation available | Adapter rules and limitation |
 |---|---|---|---|
 | [MIRAGE](https://github.com/gzxiong/MIRAGE) | Medical multiple-choice RAG; 7,663 questions across five sub-benchmarks, using a pinned MedRAG corpus/configuration | Answer accuracy, per sub-benchmark and macro | Count MIRAGE as **one** dataset family. Use question-only retrieval: answer options are excluded from retrieval input. Its benchmark does not provide universal retrieval qrels; do not fabricate nDCG/MRR for missing labels. Report answer accuracy and available evidence diagnostics separately. Pin and document the selected MedRAG corpus and its own terms. |
-| [CLERC](https://huggingface.co/datasets/jhu-clsp/CLERC) | Legal case retrieval plus retrieval-augmented analysis/generation; published data has separate retrieval and generation files and a large collection | Citation/positive-passage retrieval; generation references where supplied | Use official collection and query splits, not the preview's 20 sampled negatives as the whole corpus. Map case IDs/citations to chunks. Check each task file's actual fields and license before ingest; its card is still incomplete. Do not reduce legal answer correctness to lexical overlap. |
+| [CLERC](https://huggingface.co/datasets/jhu-clsp/CLERC) | Legal case retrieval plus retrieval-augmented analysis/generation; published data has separate retrieval and generation files and a large collection | Citation/positive-passage retrieval; generation references where supplied | Use official document/passage collections and their mapping; the published collection is roughly 18 GB compressed. Do not use the preview's 20 sampled negatives as the whole corpus. The [published qrels directory](https://huggingface.co/datasets/jhu-clsp/CLERC/tree/main/qrels) contains test retrieval judgments; create a declared development/held-out partition of those query IDs if tuning is needed. Check license before ingest; the card is incomplete. Do not reduce legal answer correctness to lexical overlap. |
 | [HotpotQA](https://hotpotqa.github.io/) | Multi-hop open-domain QA over the fullwiki corpus | Answer EM/F1, supporting-fact EM/F1 | Use the **fullwiki** setting for primary retrieval; the distractor set supplies curated candidate documents and would overstate real retrieval quality. Preserve the benchmark's supporting-fact IDs and official normalization. Use labeled development data for held-out reporting; hidden test is not assumed scoreable locally. |
 | [QASPER](https://huggingface.co/datasets/allenai/qasper) | Long scientific-paper QA; 5,049 questions over 1,585 NLP papers | Answer F1 and evidence-selection F1 from annotations | The official task gives the target paper. Restrict retrieval to that paper's chunks for the primary benchmark; cross-paper retrieval would be a separately named variant. Preserve multiple annotators, yes/no, free-form, extractive, and unanswerable cases. Small corpus, long-context stress. |
 | [KILT-FEVER](https://huggingface.co/datasets/facebook/kilt_tasks) | Claim verification against the pinned KILT Wikipedia snapshot; FEVER config has 104,966 train and 10,444 validation claims | Label accuracy plus provenance/evidence retrieval | Use KILT's own knowledge source and provenance mapping, not HotpotQA's different Wikipedia snapshot. Track page and passage match separately. Verify availability of gold provenance by split; use validation for scoring where test evidence is hidden. |
 
 For every adapter: snapshot source URL and revision/hash, exact split counts, corpus units, licenses and attribution, reference format, evaluation script version, and storage footprint. Check individual corpus licenses and data-use terms before sending text to a hosted API. Noncommercial research does **not** automatically grant permission to redistribute data or send it to third parties. Store dataset downloads outside Git with a reproducible manifest. Fail adapter validation when a referenced evidence ID cannot be mapped to the indexed corpus; report the unmapped fraction.
+
+### Tuning and held-out split policy
+
+The adapter declares a `development` query set and a disjoint `reporting` query set before any prompt/rubric or retrieval tuning. For official training/validation/test data, prefer training or validation for development and a labeled, locally scoreable held-out partition for reporting. Where only one labeled public benchmark partition exists, hash the native query ID plus seed 1729 into a 20% development / 80% reporting split; preserve the original IDs and say that the score is on this derived split rather than the full official leaderboard set. A question's multiple annotations and its source paper/case stay together. No answer, qrel, or supporting-fact field enters retrieval or reranking requests.
+
+| Dataset | Planned development data | Planned locally scoreable reporting data |
+|---|---|---|
+| MIRAGE | Deterministic 20% of each of its five published subtasks | Remaining 80% of each subtask; also report subtask counts. |
+| CLERC | Generation `train` for answer-format work; deterministic 20% of public test retrieval queries if retrieval tuning is needed | Remaining 80% of public test retrieval queries and untouched generation `test`, subject to ID/schema audit. Direct/indirect and document/passage qrels stay separate. |
+| HotpotQA | Official train data, with any development sample declared | Labeled fullwiki development set; never claim locally scored hidden-test results. |
+| QASPER | Official train/validation papers | Official test papers if their public annotations and evaluator are available; otherwise a predeclared holdout from labeled validation papers. Split by paper, not question. |
+| KILT-FEVER | Official train claims | Labeled validation claims with available provenance; test labels are not assumed public. |
+
+The source audit verifies every proposed split and the generator–retrieval query alignment before indexing. If any task lacks the expected scoreable references, keep its retrieval and answer results separate, mark unavailable metrics, and revise the split manifest **before** a report run. Do not choose replacements based on observed model performance.
 
 ## 5. Retrieval design
 
@@ -129,6 +145,8 @@ Pre-rerank diagnostics: candidate recall at N, hit rate, MRR/nDCG where labels a
 | Simple TypeSafe JEV | Pointwise JEV baseline | One stable binary **Noul yes-probability** rubric asking whether the passage contains evidence useful for answering the query; rank by returned `noul` probability, with stable retrieval-rank tie break. |
 
 JEV's Noul output is a probability for a binary proposition; a middle value expresses uncertainty, not a separate “maybe” class. Store rubric text and resolved model name. The TypeSafe account's available models come from `/v1/models`; an alias may resolve to a different model, so persist both requested and resolved names. Do not silently switch JEV mode, rubric, or candidate text across datasets. A domain-specific rubric is a separate registered variant, not an unnoticed tweak to the common baseline.
+
+Initial common rubric, recorded verbatim with a rubric version: **“Does this passage contain evidence that would help answer the question accurately?”** The `state` includes the query and exactly one candidate passage with explicit delimiters and stable IDs; the output is the Noul yes probability. The common rubric is frozen after development fixtures and before reporting queries. A relevance score is not automatically a calibrated probability of answer correctness, and a later revised rubric starts a new experimental arm.
 
 Common reranker limits: same max candidate count, same displayed chunk text, documented model-specific token limit/truncation, stable ties, missing-score policy, and fixed timeouts. Record mean and distribution of input tokens by model; different tokenization can make exact token equality impossible, so report both characters and model tokens. All rerankers get the same IDs even if one must truncate text. Local warm-up and provider cold start are reported separately.
 
@@ -188,6 +206,10 @@ The **$50 USD ceiling** is a hard global cap on incremental experiment spend acr
 
 Forecast calls as `sum(query × retriever arm × unique candidate pairs)` for pointwise JEV, adjusted for reusable identical query–chunk–rubric scores and retry rates. For example, 1,000 queries × 3 retrieval arms × 100 candidates can approach 300,000 pair scores before deduplication. Compute the forecast from the selected splits before any bulk run. Caching may share a score only when query, chunk text/hash, rubric, model revision, truncation, and JEV mode match exactly; contextual scores are not interchangeable with independent scores.
 
+At TypeSafe's [publicly stated $0.042 per million input tokens](https://typesafe.ai/blog/introducing-system-one-models-and-jev), 300,000 independent pairs averaging 512 billed input tokens would be about 153.6 million tokens, or **$6.45 for JEV input alone**. This is an illustration, not a run quote: actual prompt length, unique-pair overlap, retries, account credits, model pricing, OpenRouter generations/judges, and infrastructure change the total. The preflight must obtain an account-specific price/rate snapshot and a measured token distribution on a tiny development sample, then produce a per-stage upper-bound forecast before any paid batch. A $50 cap does not imply that all five complete datasets can be fully scored and generated; report exact coverage if the cap binds.
+
+The planned comparison matrix is five datasets × three retrieval arms × five reranker arms (75 ranking cells), with the **same query IDs per dataset across its cells**. Stage 1 may compute local retrieval metrics on larger scoreable sets without JEV or generator spend. Stage 2 uses a deterministic, stratified matched subset for all five rerankers; target at least 200 eligible questions per dataset where available, then size the final sample using observed paired variance and the remaining budget before freezing it. Stage 3 generates answers for those same matched cells and uses Ragas judges only on a prespecified subset. A reduced sample is reported as reduced coverage, not a complete-dataset result. The full matrix and any live load profile are part of the owner-triggered experiment, not development testing.
+
 ## 10. Rate limits and load methodology
 
 The TypeSafe adapter uses one account-wide async limiter shared by all workers: requests/minute and tokens/minute if known, bounded in-flight concurrency, idempotent retry rules, jittered exponential backoff honoring `Retry-After`, circuit breaking for sustained faults, and per-attempt budget accounting. Discover published/account-specific limits before tuning concurrency; an absent published number is recorded as unknown, not guessed. Rate limits may be dynamic, so a bounded calibration ramp measures observed throttling.
@@ -209,6 +231,8 @@ Load phases, after offline quality passes: single-user baseline; controlled conc
 | Service/load | FastAPI for an answer endpoint; Locust for repeatable ramp and burst profiles; standard host/GPU telemetry. |
 
 Exact dependency versions and container image digest are pinned when implementation starts. `LangChain`, `Ragas`, and `LangSmith` are not used as interchangeable “evaluation frameworks”: LangChain composes calls, Ragas computes optional answer metrics, and LangSmith is optional hosted trace inspection. The canonical artifact store is local/exportable, so experiments do not depend on a paid tracing service.
+
+Configuration reads `TYPESAFE_API_KEY` and `JEV_MODEL` for TypeSafe and `OPENROUTER_API_KEY` for generation. The run manifest records only whether credentials are present, never their values. Model IDs, routing settings, prompts, token limits, request budgets, dataset revisions, and the $50 cap live in versioned config, with command-line overrides echoed to the manifest. A missing key blocks only its live adapter; offline fixtures, local retrievers, metrics, and replay remain testable.
 
 ## 12. Run layout and reproducibility
 
@@ -247,7 +271,44 @@ This is the order for the **subsequent coding phase**. A milestone is done only 
 
 Recommended execution scale: tiny fixture → one validation slice per dataset → all validation queries for baseline ranking metrics → matched answer-generation subset → held-out full answer run if affordable → operational workload. Sample queries deterministically and stratify by length/task/answerability, then report the sample definition. Keep all five datasets in the final suite even if early development starts with one. Scale production load independently from article-quality testing.
 
+### Repository implementation map
+
+Keep the existing fixed-pool `jev_eval` pilot commands and run artifacts readable. Build the new harness in a separate `src/jev_eval/rag/` package and expose it through new `jev-eval rag ...` subcommands; shared existing functions may be extracted only when their current tests remain green. Proposed ownership:
+
+| Area | Planned files and responsibilities |
+|---|---|
+| Contracts/config | `rag/contracts.py`, `rag/config.py`, `rag/registry.py`: versioned records, capability checks, frozen run manifest and plugin registry. |
+| Artifact/replay core | `rag/artifacts.py`, `rag/runner.py`: content-addressed blobs, Parquet records, atomic writes, stage dependency keys, resume and selective replay. |
+| Data | `rag/datasets/{mirage,clerc,hotpotqa,qasper,kilt_fever}.py`: source readers, native IDs/splits, corpus/evidence mapping, task output formats; shared adapter protocol. |
+| Retrieval | `rag/retrieval.py`, `rag/indexes.py`: BM25/FAISS adapters, RRF, frozen pools, index manifests and build validation. |
+| Reranking | `rag/reranking.py`, `rag/clients/typesafe.py`: no-rerank/local models/JEV, exact request/response capture, limiter and retry ledger. |
+| Answer path | `rag/context.py`, `rag/clients/openrouter.py`, `rag/generation.py`: token packing, fixed prompts, answer parsing, citations, provider metadata. |
+| Evaluation/reporting | `rag/evaluation.py`, `rag/metrics.py`, `rag/reporting.py`: native metric wrappers, IR/Ragas registry, paired comparisons, quality/cost/latency reports. |
+| Operations | `rag/service.py`, `rag/telemetry.py`, `rag/budget.py`, `rag/load/`: endpoint, spans, cost reservations, fake-provider and later real load profiles. |
+| User-facing entry | `configs/rag/` frozen configs; `jev-eval rag audit-sources`, `index`, `retrieve`, `rerank`, `generate`, `evaluate`, `replay`, `report`, `serve`, and `load` commands; `tests/rag/` fixtures and contract tests. |
+
+The command-line runner defaults to `--dry-run` for any command that could call a paid provider or create large indexes. A live command needs a frozen manifest plus an explicit run mode and budget forecast; `rag load` against real providers remains disabled until the owner-triggered experiment. Each command prints the stage boundary it will reuse, the exact number of pending calls, estimated worst-case spend, and artifact destination before dispatch.
+
 Future algorithms can be evaluated from the stored stage boundaries when their required inputs already exist. A future method that asks JEV new questions or scores documents outside the saved pool will require those specific new calls. No novelty claim is planned for the standard JEV baseline.
+
+### Development verification and permission boundary
+
+The owner's instruction is to run all required **development tests** and wait for a separate instruction before the full experiment. Development tests may use synthetic documents and a handful of public benchmark examples. They must not launch the 75-cell matrix, bulk TypeSafe scoring, full answer generation, or live-provider stress testing. Local model smoke tests and at most a small, metered API preflight are allowed only after the $50 ledger and credential checks are working; every real request is counted against the global cap.
+
+| Layer | Required development check | Pass condition |
+|---|---|---|
+| Schemas and artifacts | Valid/invalid records, stable content hashes, serialization round trips, incomplete/crash recovery | Malformed IDs, mismatched hashes, secret fields, and mixed revisions are rejected; replay resolves exact upstream artifacts. |
+| Dataset adapters | Tiny official examples for all five adapters; split assignment and corpus/evidence joins | Native IDs, answer references, and qrels match the source; no label reaches scorer input; unmapped evidence is counted or blocks as specified. |
+| Retrieval | Small hand-checked corpus for BM25/dense/hybrid; approximate-vs-exact dense sanity check | Deterministic ordered pools, stable ties, no duplicate IDs, expected positives recoverable at depth, exact candidate text preserved. |
+| Rerankers | One/few query–passage fixtures for each local model; mocked TypeSafe responses and failures | All five arms preserve the same pool IDs; truncation, missing scores, retries, 429, timeout, and model mismatch are visible in records. |
+| Generation and evaluation | Mock OpenRouter outputs for each task format; native metric gold examples | Prompt/context hashes and citations round-trip; format errors count; each metric's denominator and applicability are correct. |
+| Budget/rate limits | Simulated concurrent workers, stale price, retry surge, insufficient remaining dollars/tokens | Shared limiter enforces caps; reservation precedes dispatch; no double charge on resume; at-cap dispatch is prevented. |
+| Replay and tracing | Recompute ranking formula, context selection, generator, evaluator independently from saved boundaries | Identical config makes zero new external calls; a changed config invalidates only downstream artifacts; live versus replay timing/cost remains distinct. |
+| Service/load harness | Locust against a local fake provider with controlled delay/429/5xx and telemetry | p50/p95/p99, queue, retries, throughput, fallback, and cost attribution match injected conditions without real provider load. |
+
+Run the repository's existing test suite and lint on each implementation milestone, plus the targeted contract tests above. Record test commands, pass/fail counts, skipped optional-model checks, and fixture revisions in a development report. A single live TypeSafe and OpenRouter preflight can verify authentication, response schema, exact model/provider, token usage, and price/latency metadata when keys are available; avoid using a real benchmark question for this check if dataset terms have not cleared hosted inference. An absent key or unverified dataset license is a named untested integration, never a claimed pass.
+
+Before the owner-triggered full experiment, publish a **run-ready packet**: clean code commit and lockfile, five adapter source audits, frozen split/query manifests, model/rubric/prompt/index revisions, all development test results, account-specific price/rate limits, forecast with contingency below $50, planned query counts, and the exact commands that would run. Stop there and wait for the owner's instruction. The later full run begins only from that frozen packet; unexpected model drift, cost overrun, or source mismatch stops it and produces an incident record rather than silently changing the protocol.
 
 ## 14. Failure modes and controls
 
