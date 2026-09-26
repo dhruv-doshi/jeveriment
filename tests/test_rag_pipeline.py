@@ -295,11 +295,13 @@ def test_parallel_run_and_replay_without_provider_calls(tmp_path, monkeypatch, c
     monkeypatch.setattr("sys.argv", ["jev-eval", "rag", "matrix", "configs/rag/experiment.yaml",
                                      "--datasets", "mirage", "--retrievers", "bm25",
                                      "--rerankers", "retrieval_order", "--run-root", str(tmp_path / "runs"),
-                                     "--split", "reporting", "--limit", "2", "--workers", "2", "--execute"])
+                                     "--split", "reporting", "--limit", "2", "--workers", "2",
+                                     "--output-json", str(tmp_path / "matrix.json"), "--execute"])
     main()
     executed = json.loads(capsys.readouterr().out)
     assert executed["cells"] == 1 and executed["results"][0]["queries"] == 2
     assert executed["results"][0]["workers"] == 2
+    assert json.loads((tmp_path / "matrix.json").read_text())["status"] == "complete"
 
 
 def test_fake_load_retries_and_records_tail_latency(tmp_path):

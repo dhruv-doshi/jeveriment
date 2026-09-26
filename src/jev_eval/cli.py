@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 from .rag.config import load_experiment
@@ -59,6 +60,7 @@ def main() -> None:
     matrix.add_argument("--provider-only")
     matrix.add_argument("--revisions-json")
     matrix.add_argument("--limits-json")
+    matrix.add_argument("--output-json", help="Write progress after every completed cell")
     report = rag_sub.add_parser("report")
     report.add_argument("config")
     report.add_argument("results", nargs="+")
@@ -192,6 +194,13 @@ def main() -> None:
 
         setup_tracing(Path(args.run_root) / experiment.experiment_id)
         outcomes = []
+        def save_progress(status):
+            if args.rag_command == "matrix" and args.output_json:
+                from .io import write_json
+
+                write_json(args.output_json, {**forecast, "status": status, "results": outcomes})
+
+        save_progress("running")
         for dataset in datasets:
             runtime = ExperimentRuntime(experiment, args.run_root, dataset,
                                         revisions, args.provider_only, limits)
@@ -204,8 +213,13 @@ def main() -> None:
                                                     workers=args.workers)
                         outcomes.append({"dataset": dataset, "retriever": retriever,
                                          "reranker": reranker, **outcome})
+                        save_progress("running")
+                        print(f"completed {dataset}/{retriever}/{reranker}: "
+                              f"{outcome['queries']} queries, {outcome['failed_queries']} failed",
+                              file=sys.stderr, flush=True)
             finally:
                 runtime.close()
+        save_progress("complete")
         print(json.dumps({**forecast, "results": outcomes}, indent=2))
     elif args.rag_command == "report":
         from .rag.reporting import write_report

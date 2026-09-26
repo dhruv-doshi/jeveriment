@@ -2,6 +2,24 @@
 
 Work in the `feature/production-rag` worktree. These commands prepare local artifacts or inspect the plan. A complete five-dataset run and live load test wait for the owner's separate instruction.
 
+## One dataset at a time: ranking only
+
+`scripts/run_dataset.py` is the single entry point for a QASPER, CLERC, HotpotQA, or KILT-FEVER ranking run. It fetches pinned sources for the selected dataset, verifies checksums where published, prepares the corpus and labels, builds the dense index, runs all 3 retrievers × 5 rerankers on the reporting split, and writes a rough ranking report, progress file, raw responses, traces, and a timestamped warning/error log. It does **not** call OpenRouter. Repeating the same run reuses prepared sources, indexes, candidate pools, and reranker artifacts. The report includes ranking metrics and global ledger usage; final answer quality is not measured.
+
+The default is a no-download plan for 10 queries per cell:
+
+```sh
+python3 scripts/run_dataset.py qasper --limit 10
+```
+
+On a VM with `uv` installed, put `TYPESAFE_API_KEY` and `JEV_MODEL` in an ignored `.env` or the environment. Put your account's measured TypeSafe `rpm`, `tpm`, `inflight`, `token_budget`, `request_budget`, `input_usd_per_million`, and `output_usd_per_million` in ignored `data/limits.json` under a `typesafe` object. The public price is not evidence of account rate limits. Then one command runs the ranking experiment:
+
+```sh
+python3 scripts/run_dataset.py qasper --limit 10 --volume /mnt/rag --execute
+```
+
+Replace `qasper` with `clerc`, `hotpotqa`, or `kilt_fever` for the next dataset. The large-source paths and official revisions are built into the launcher. Use `--limit all` only after the configured budget and VM capacity support it. The script fails before downloading if the conservative Jev forecast exceeds `budget_usd` in `configs/rag/experiment.yaml`; the current cap is $50. The full reporting splits are far larger than the 10-query example. Large datasets require at least 250 GiB free on both source and run volumes, and the script checks the memory needed for the current exact FAISS index before building it. Logs and `status.json` are under `<run-root>/production_rag_v1/launcher/<dataset>/<UTC timestamp>/`; the status file points to each result, report, and summary. Keep the complete run directory and prepared `chunks.sqlite` to replay rankings into a later answer-generation run.
+
 ```sh
 uv sync --group dev --extra local --extra service --extra load --extra observability
 uv run jev-eval rag validate configs/rag/experiment.yaml
