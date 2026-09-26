@@ -1,4 +1,6 @@
+from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
+from time import sleep
 
 import pytest
 
@@ -75,3 +77,22 @@ def test_replay_and_targeted_invalidation(tmp_path):
     artifact.write_text('{"doubled":7}')
     with pytest.raises(ValueError, match="hash"):
         store.get(record.output_hash)
+
+
+def test_parallel_same_stage_is_executed_once(tmp_path):
+    store = ArtifactStore(tmp_path)
+    calls = []
+
+    def work(value):
+        calls.append(1)
+        sleep(0.02)
+        return {"value": value["value"] + 1}
+
+    def run(_):
+        return execute_stage(store, run_id="r", stage="s", plugin_id="p",
+                             config={}, upstream_hashes=(), input_value={"value": 1}, call=work)
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(run, range(8)))
+    assert len(calls) == 1
+    assert all(result[0] == {"value": 2} for result in results)

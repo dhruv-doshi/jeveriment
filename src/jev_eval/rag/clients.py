@@ -23,6 +23,8 @@ class ProviderReply:
     elapsed_ms: float
     cache_hit: bool
     provider_inference_ms: float | None = None
+    attempt_id: int | None = None
+    queue_wait_ms: float = 0.0
 
 
 class RateGate:
@@ -39,6 +41,8 @@ class RateGate:
         CREATE TABLE IF NOT EXISTS leases (id TEXT PRIMARY KEY,expires REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS cooldown (id INTEGER PRIMARY KEY CHECK(id=1),until REAL NOT NULL);
         INSERT OR IGNORE INTO cooldown VALUES(1,0);
+        CREATE TABLE IF NOT EXISTS health (id INTEGER PRIMARY KEY CHECK(id=1),failures INTEGER NOT NULL);
+        INSERT OR IGNORE INTO health VALUES(1,0);
         """)
         db.close()
 
@@ -70,7 +74,15 @@ class RateGate:
 
     def penalize(self, seconds):
         with sqlite3.connect(self.path, timeout=30) as db:
+            db.execute("UPDATE health SET failures=failures+1 WHERE id=1")
+            failures = db.execute("SELECT failures FROM health WHERE id=1").fetchone()[0]
             db.execute("UPDATE cooldown SET until=MAX(until,?) WHERE id=1", (time.time() + min(float(seconds), 60),))
+            if failures >= 5:
+                db.execute("UPDATE cooldown SET until=MAX(until,?) WHERE id=1", (time.time() + 30,))
+
+    def succeeded(self):
+        with sqlite3.connect(self.path, timeout=30) as db:
+            db.execute("UPDATE health SET failures=0 WHERE id=1")
 
 
 class BudgetedHTTP:
@@ -88,21 +100,31 @@ class BudgetedHTTP:
         self.output_price = output_usd_per_million / Decimal(1_000_000)
         self.http = httpx.Client(base_url=base_url, timeout=60, transport=transport,
                                  headers={"Authorization": f"Bearer {token}"}, follow_redirects=False)
+        self._local = threading.local()
+
+    def _ledger(self):
+        ledger = getattr(self._local, "ledger", None)
+        if ledger is None:
+            ledger = Ledger(self.ledger_path)
+            self._local.ledger = ledger
+        return ledger
 
     def post(self, endpoint: str, payload: dict, *, max_input_tokens: int,
-             max_output_tokens: int, validate, attempts=4) -> ProviderReply:
+             max_output_tokens: int, validate, attempts=4, provenance=None) -> ProviderReply:
         request_key = digest({"provider": self.provider, "endpoint": endpoint, "payload": payload})
-        ledger = Ledger(self.ledger_path)
+        ledger = self._ledger()
         cached = ledger.cached(request_key)
         if cached is not None:
             validate(cached)
-            return ProviderReply(cached, "cached", 0.0, True)
+            return ProviderReply(cached, ledger.cached_path(request_key), 0.0, True)
         reserved_tokens = max_input_tokens + max_output_tokens
         reserved_usd = self.input_price * max_input_tokens + self.output_price * max_output_tokens
         if reserved_tokens > self.gate.tpm:
             raise ValueError("Request exceeds configured provider token/minute limit")
         for retry in range(attempts):
+            queued_at = time.monotonic()
             lease = self.gate.acquire(reserved_tokens)
+            queue_wait_ms = (time.monotonic() - queued_at) * 1000
             attempt_id = None
             try:
                 attempt_id = ledger.reserve(request_key, reserved_usd, reserved_tokens,
@@ -116,14 +138,16 @@ class BudgetedHTTP:
                         body = response.json()
                     except ValueError:
                         body = {"error": "non_json_response"}
-                    write_json(raw_path, {"request": payload, "response": body,
+                    write_json(raw_path, {"request": payload, "response": body, "provenance": provenance,
                                           "status_code": response.status_code, "elapsed_ms": elapsed,
+                                          "queue_wait_ms": queue_wait_ms,
                                           "timestamp": now(), "request_id": response.headers.get("x-request-id"),
                                           "server_timing": response.headers.get("server-timing")})
                 except httpx.TransportError as exc:
                     elapsed = (time.monotonic() - started) * 1000
-                    write_json(raw_path, {"request": payload, "error": type(exc).__name__,
-                                          "elapsed_ms": elapsed, "timestamp": now()})
+                    write_json(raw_path, {"request": payload, "provenance": provenance, "error": type(exc).__name__,
+                                          "elapsed_ms": elapsed, "queue_wait_ms": queue_wait_ms,
+                                          "timestamp": now()})
                     ledger.finish(attempt_id, "transport_error", raw_path, error=type(exc).__name__)
                     if retry + 1 == attempts:
                         raise RuntimeError("Transport retries exhausted; charge reservation retained") from exc
@@ -154,12 +178,51 @@ class BudgetedHTTP:
                 cost = self.input_price * input_tokens + self.output_price * output_tokens
                 ledger.finish(attempt_id, "success", raw_path, cost=cost, tokens=input_tokens + output_tokens)
                 ledger.success(request_key, raw_path, body.get("model", "unknown"))
+                self.gate.succeeded()
                 if Decimal(ledger.totals()["cost_usd"]) > self.budget_usd:
                     raise ValueError("Provider actual charge exceeded reserved global cap; stop run")
-                return ProviderReply(body, str(raw_path), elapsed, False)
+                return ProviderReply(body, str(raw_path), elapsed, False,
+                                     attempt_id=attempt_id, queue_wait_ms=queue_wait_ms)
             finally:
                 self.gate.release(lease)
         raise RuntimeError("Retries exhausted")
+
+    def generation_metadata(self, generation_id: str, attempt_id: int | None):
+        if self.provider != "openrouter":
+            raise ValueError("Generation metadata is only available for OpenRouter")
+        path = self.root / "raw" / "openrouter_metadata" / f"{generation_id}.json"
+        if path.exists():
+            return json.loads(path.read_text()).get("response")
+        lease = self.gate.acquire(0)
+        try:
+            ledger = self._ledger()
+            meta_attempt = ledger.reserve(digest({"metadata": generation_id}), Decimal(0), 0,
+                                          self.budget_usd, self.max_tokens, self.max_requests)
+            started = time.monotonic()
+            try:
+                response = self.http.get("/generation", params={"id": generation_id})
+                body = response.json()
+                status = response.status_code
+            except (httpx.TransportError, ValueError) as exc:
+                body, status = {"error": type(exc).__name__}, 0
+            write_json(path, {"response": body, "status_code": status,
+                              "elapsed_ms": (time.monotonic() - started) * 1000, "timestamp": now()})
+            ledger.finish(meta_attempt, "success" if status == 200 else "metadata_error", path,
+                          cost=Decimal(0), tokens=0, error=None if status == 200 else str(status))
+            data = body.get("data") if status == 200 else None
+            if data and attempt_id is not None and isinstance(data.get("total_cost"), (int, float)):
+                original_path = self.root / "raw" / "openrouter"
+                match = next(original_path.glob(f"{attempt_id:08d}-*.json"), None)
+                if match:
+                    old = json.loads(match.read_text())
+                    usage = old.get("response", {}).get("usage", {})
+                    tokens = usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
+                    ledger.finish(attempt_id, "success", match, cost=Decimal(str(data["total_cost"])), tokens=tokens)
+                    if Decimal(ledger.totals()["cost_usd"]) > self.budget_usd:
+                        raise ValueError("Provider billed cost exceeded reserved global cap; stop run")
+            return data
+        finally:
+            self.gate.release(lease)
 
 
 def validate_jev(body):

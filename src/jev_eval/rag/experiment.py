@@ -1,10 +1,14 @@
 """Experiment composition. Stage boundaries are persisted before downstream work."""
 
 import os
+import tempfile
 import threading
-from concurrent.futures import ThreadPoolExecutor
+import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from decimal import Decimal
 from pathlib import Path
+
+from dotenv import load_dotenv
 
 from jev_eval.io import digest, file_digest, read_json, write_json
 
@@ -16,12 +20,14 @@ from .contracts import (
     CandidatePool,
     GenerationResult,
     GoldRecord,
+    JudgeResult,
     QueryRecord,
     RerankResult,
 )
 from .datasets import adapter_for
 from .embedding import QwenEncoder
 from .evaluation import evaluate_answer, evaluate_ranking
+from .judge import JUDGE_RUBRIC_V1, judge_answer
 from .reranking import (
     CrossEncoderModel,
     QwenRerankerModel,
@@ -36,17 +42,26 @@ from .runner import execute_stage
 def prepare_dataset(spec: ExperimentSpec, dataset_id: str, source_root: str | Path, run_root: str | Path):
     adapter = adapter_for(dataset_id, source_root)
     adapter.require_files()
-    root = Path(run_root) / spec.experiment_id / dataset_id
-    if (root / "source_manifest.json").exists():
-        raise FileExistsError(f"Prepared source already exists at {root}; use a new run ID for changed inputs")
-    root.mkdir(parents=True, exist_ok=True)
-    source_files = {name: file_digest(adapter.root / name) for name in adapter.required_files}
+    final_root = Path(run_root) / spec.experiment_id / dataset_id
+    if final_root.exists():
+        raise FileExistsError(f"Prepared source already exists at {final_root}; use a new run ID for changed inputs")
+    final_root.parent.mkdir(parents=True, exist_ok=True)
+    root = Path(tempfile.mkdtemp(prefix=f".{dataset_id}.pending-", dir=final_root.parent))
+    source_paths = [adapter.root / name for name in adapter.required_files]
+    if dataset_id == "mirage":
+        source_paths.extend(adapter._corpus_files())
+    if dataset_id == "qasper":
+        source_paths.extend([adapter.root / "qasper.jsonl"] if (adapter.root / "qasper.jsonl").exists() else adapter._parquet_files())
+    source_files = {str(path.relative_to(adapter.root)): file_digest(path) for path in source_paths}
     index = ChunkIndex(root / "chunks.sqlite")
     chunk_count = index.add(adapter.iter_chunks())
     pairs = list(adapter.iter_queries())
     ids = [query.query_id for query, _ in pairs]
     if len(ids) != len(set(ids)) or not pairs or not chunk_count:
         raise ValueError("Source has duplicate/empty query IDs or empty corpus")
+    unmapped = sorted({cid for _, item in pairs for cid in item.qrels if index.db.execute("SELECT 1 FROM chunks WHERE chunk_id=?", (cid,)).fetchone() is None})
+    if unmapped:
+        raise ValueError(f"{len(unmapped)} gold evidence IDs do not map to corpus; examples: {unmapped[:5]}")
     queries = [query.model_dump() for query, _ in pairs]
     gold = [item.model_dump() for _, item in pairs]
     write_json(root / "queries.json", queries)
@@ -56,6 +71,7 @@ def prepare_dataset(spec: ExperimentSpec, dataset_id: str, source_root: str | Pa
                 "dataset_spec_hash": digest(next(item.model_dump(mode="json") for item in spec.datasets if item.id == dataset_id)),
                 "query_hash": digest(queries), "gold_hash": digest(gold)}
     write_json(root / "source_manifest.json", manifest)
+    root.rename(final_root)
     return manifest
 
 
@@ -63,6 +79,7 @@ class ExperimentRuntime:
     def __init__(self, spec: ExperimentSpec, run_root: str | Path, dataset_id: str,
                  revisions: dict[str, str] | None = None, provider_only: str | None = None,
                  limits: dict | None = None, transport=None):
+        load_dotenv()
         self.spec, self.dataset_id = spec, dataset_id
         self.root = Path(run_root) / spec.experiment_id
         self.dataset_root = self.root / dataset_id
@@ -78,6 +95,7 @@ class ExperimentRuntime:
         self._dense = None
         self._clients = {}
         self._lock = threading.RLock()
+        self._jev_executor = None
         self.queries = [QueryRecord.model_validate(item) for item in read_json(self.dataset_root / "queries.json")]
         self.gold = {item.query_id: item for item in (GoldRecord.model_validate(item) for item in read_json(self.dataset_root / "gold.json"))}
 
@@ -104,25 +122,36 @@ class ExperimentRuntime:
         with self._lock:
             if provider in self._clients:
                 return self._clients[provider]
-        from dotenv import load_dotenv
+            key = os.getenv("TYPESAFE_API_KEY" if provider == "typesafe" else "OPENROUTER_API_KEY")
+            limits = self.limits.get(provider)
+            if not limits:
+                raise ValueError(f"Account-specific rate and price limits missing for {provider}")
+            client = BudgetedHTTP(
+                provider=provider, root=self.root, token=key or "",
+                base_url=os.getenv("TYPESAFE_API_BASE_URL", "https://api.typesafe.ai") if provider == "typesafe" else "https://openrouter.ai/api/v1",
+                budget_usd=self.spec.budget_usd,
+                max_tokens=int(limits["token_budget"]), max_requests=int(limits["request_budget"]),
+                input_usd_per_million=Decimal(str(limits["input_usd_per_million"])),
+                output_usd_per_million=Decimal(str(limits["output_usd_per_million"])),
+                rpm=int(limits["rpm"]), tpm=int(limits["tpm"]), inflight=int(limits["inflight"]),
+                transport=self.transport,
+            )
+            self._clients[provider] = client
+            return client
 
-        load_dotenv()
-        key = os.getenv("TYPESAFE_API_KEY" if provider == "typesafe" else "OPENROUTER_API_KEY")
-        limits = self.limits.get(provider)
-        if not limits:
-            raise ValueError(f"Account-specific rate and price limits missing for {provider}")
-        client = BudgetedHTTP(
-            provider=provider, root=self.root, token=key or "",
-            base_url=os.getenv("TYPESAFE_API_BASE_URL", "https://api.typesafe.ai") if provider == "typesafe" else "https://openrouter.ai/api/v1",
-            budget_usd=self.spec.budget_usd,
-            max_tokens=int(limits["token_budget"]), max_requests=int(limits["request_budget"]),
-            input_usd_per_million=Decimal(str(limits["input_usd_per_million"])),
-            output_usd_per_million=Decimal(str(limits["output_usd_per_million"])),
-            rpm=int(limits["rpm"]), tpm=int(limits["tpm"]), inflight=int(limits["inflight"]),
-            transport=self.transport,
-        )
+    def _jev_pool(self):
         with self._lock:
-            return self._clients.setdefault(provider, client)
+            if self._jev_executor is None:
+                self._jev_executor = ThreadPoolExecutor(max_workers=int(self.limits["typesafe"]["inflight"]))
+            return self._jev_executor
+
+    def close(self):
+        with self._lock:
+            if self._jev_executor is not None:
+                self._jev_executor.shutdown(wait=True)
+                self._jev_executor = None
+            for client in self._clients.values():
+                client.http.close()
 
     def _retrieval_hits(self, query, arm):
         depth = self.spec.max_saved_depth
@@ -172,14 +201,18 @@ class ExperimentRuntime:
         if arm not in {item.id for item in self.spec.rerankers}:
             raise ValueError(f"Unknown reranker arm: {arm}")
         item = next(spec for spec in self.spec.rerankers if spec.id == arm)
+        jev_model = os.getenv("JEV_MODEL") if arm == "jev" else None
+        if arm == "jev" and not jev_model:
+            raise ValueError("JEV_MODEL is required for live JEV scoring")
         config = {"arm": arm, "params": item.params, "revision": self.revisions.get(str(item.params.get("model"))),
-                  "jev_model": os.getenv("JEV_MODEL") if arm == "jev" else None}
+                  "jev_model": jev_model}
 
         def call(_):
             if arm == "retrieval_order":
                 result = retrieval_order(pool)
             elif arm == "jev":
-                result = score_with_jev(query, pool, self.index, self._client("typesafe"), workers=int(self.limits["typesafe"]["inflight"]))
+                result = score_with_jev(query, pool, self.index, self._client("typesafe"),
+                                        model=jev_model, executor=self._jev_pool())
             else:
                 result = score_with_model(query, pool, self.index, self._local_model(arm), arm)
             return result.model_dump()
@@ -217,25 +250,49 @@ class ExperimentRuntime:
         return (context, GenerationResult.model_validate(generation_value),
                 (context_record, generation_record), (context_cached, generation_cached))
 
-    def run_one(self, query, retriever, reranker, generate=False):
-        gold = self.gold[query.query_id]
+    def run_one(self, query, retriever, reranker, generate=False, judge=False):
+        if judge and not generate:
+            raise ValueError("Judging requires a generated answer")
+        gold = self.gold.get(query.query_id)
         pool, pool_record, pool_cached = self.retrieve(query, retriever)
         ranking, rerank_record, rerank_cached = self.rerank(query, pool, pool_record, reranker)
         result = {"dataset": self.dataset_id, "query_id": query.query_id,
                   "retriever": retriever, "reranker": reranker,
                   "pool_hash": pool.ordered_hash, "ranking_hash": rerank_record.output_hash,
-                  "ranking": evaluate_ranking(ranking, gold),
+                  "retrieval": evaluate_ranking(retrieval_order(pool), gold) if gold else {"applicable": False, "reason": "service_query_has_no_labels"},
+                  "ranking": evaluate_ranking(ranking, gold) if gold else {"applicable": False, "reason": "service_query_has_no_labels"},
                   "cache": {"pool": pool_cached, "rerank": rerank_cached}}
         if generate:
             context, answer, records, cached = self.answer(query, ranking, rerank_record)
-            result["answer"] = evaluate_answer(answer, gold, context)
+            result["answer"] = evaluate_answer(answer, gold, context) if gold else {"answer_applicable": False, "reason": "service_query_has_no_labels"}
             result["answer_text"] = answer.answer
             result["citations"] = answer.citations
             result["generation_hash"] = records[1].output_hash
             result["cache"].update({"context": cached[0], "generation": cached[1]})
+            if judge:
+                judge_gold = gold or GoldRecord(dataset_id=query.dataset_id, query_id=query.query_id)
+                value, judge_record, judge_cached = execute_stage(
+                    self.store, run_id=self.spec.experiment_id, stage="judge",
+                    plugin_id=self.spec.generator.model,
+                    config={"rubric": JUDGE_RUBRIC_V1, "model": self.spec.generator.model,
+                            "provider_only": self.provider_only},
+                    upstream_hashes=(records[1].output_hash,),
+                    input_value={"query": query.model_dump(), "context": context.model_dump(),
+                                 "answer": answer.model_dump(), "gold": judge_gold.model_dump()},
+                    call=lambda _: judge_answer(query, context, answer, judge_gold,
+                                                self._client("openrouter"),
+                                                self.spec.generator.model,
+                                                self.provider_only or "").model_dump(),
+                    query_id=query.query_id, mode="live")
+                judgement = JudgeResult.model_validate(value)
+                result["judge"] = {"faithfulness": judgement.faithfulness,
+                                   "answer_relevancy": judgement.answer_relevancy,
+                                   "answer_correctness": judgement.answer_correctness}
+                result["judge_hash"] = judge_record.output_hash
+                result["cache"]["judge"] = judge_cached
         return result
 
-    def run_slice(self, *, retriever: str, reranker: str, split="development", limit=5, generate=False, workers=1):
+    def run_slice(self, *, retriever: str, reranker: str, split="development", limit=5, generate=False, judge=False, workers=1):
         if limit < 1:
             raise ValueError("Development slice limit must be positive")
         if workers < 1:
@@ -243,8 +300,41 @@ class ExperimentRuntime:
         selected = [query for query in self.queries if query.split == split][:limit]
         if not selected:
             raise ValueError(f"No queries in {split} split")
+        started = time.monotonic()
+        results = [None] * len(selected)
         with ThreadPoolExecutor(max_workers=workers) as executor:
-            results = list(executor.map(lambda query: self.run_one(query, retriever, reranker, generate), selected))
-        path = self.dataset_root / "results" / f"{retriever}__{reranker}__{split}__{limit}__{'answers' if generate else 'ranking'}__{digest(results)[:12]}.json"
+            next_index = 0
+            pending = {}
+            while next_index < min(workers, len(selected)):
+                future = executor.submit(self.run_one, selected[next_index], retriever, reranker, generate, judge)
+                pending[future] = next_index
+                next_index += 1
+            while pending:
+                done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for future in done:
+                    index = pending.pop(future)
+                    try:
+                        results[index] = future.result()
+                    except Exception as exc:
+                        if "cap" in str(exc).lower() or "budget" in str(exc).lower():
+                            for remaining in pending:
+                                remaining.cancel()
+                            raise
+                        results[index] = {"dataset": self.dataset_id, "query_id": selected[index].query_id,
+                                          "retriever": retriever, "reranker": reranker,
+                                          "status": "failed", "error_type": type(exc).__name__,
+                                          "error": str(exc)}
+                    if next_index < len(selected):
+                        new_future = executor.submit(self.run_one, selected[next_index], retriever, reranker, generate, judge)
+                        pending[new_future] = next_index
+                        next_index += 1
+        elapsed = time.monotonic() - started
+        path = self.dataset_root / "results" / f"{retriever}__{reranker}__{split}__{limit}__{'judge' if judge else 'answers' if generate else 'ranking'}__{digest(results)[:12]}.json"
         write_json(path, results)
-        return {"path": str(path), "queries": len(results), "results_hash": digest(results)}
+        metadata = {"path": str(path), "queries": len(results),
+                    "failed_queries": sum(row.get("status") == "failed" for row in results),
+                    "results_hash": digest(results), "elapsed_seconds": elapsed,
+                    "queries_per_second": len(results) / elapsed if elapsed else None,
+                    "workers": workers}
+        write_json(path.with_suffix(".meta.json"), metadata)
+        return metadata

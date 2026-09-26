@@ -85,18 +85,32 @@ class DatasetAdapter:
 
 class Mirage(DatasetAdapter):
     id = "mirage"
-    required_files = ("benchmark.json", "medrag_corpus.jsonl")
+    required_files = ("benchmark.json",)
+
+    def _corpus_files(self):
+        combined = self.root / "medrag_corpus.jsonl"
+        if combined.is_file():
+            return [combined]
+        return sorted((self.root / "medrag").glob("**/chunk/*.jsonl"))
+
+    def audit(self):
+        report = super().audit()
+        if not self._corpus_files():
+            report["missing"].append("medrag_corpus.jsonl or medrag/**/chunk/*.jsonl")
+        report["ready"] = not report["missing"]
+        return report
 
     def iter_chunks(self):
         self.require_files()
-        for row in _json_records(self.root / "medrag_corpus.jsonl"):
-            doc_id = row.get("id") or row.get("_id")
-            text = row.get("content") or row.get("text")
-            if not doc_id or not isinstance(text, str):
-                raise ValueError("MedRAG corpus row needs id and content/text")
-            chunk = _chunk(self.id, str(doc_id), "0", text, title=row.get("title"))
-            if chunk:
-                yield chunk
+        for path in self._corpus_files():
+            for row in _json_records(path):
+                doc_id = row.get("id") or row.get("_id")
+                text = row.get("content") or row.get("text")
+                if not doc_id or not isinstance(text, str):
+                    raise ValueError("MedRAG corpus row needs id and content/text")
+                chunk = _chunk(self.id, str(doc_id), "0", text, title=row.get("title"))
+                if chunk:
+                    yield chunk
 
     def iter_queries(self):
         self.require_files()
@@ -193,11 +207,32 @@ class HotpotQA(DatasetAdapter):
 
 class Qasper(DatasetAdapter):
     id = "qasper"
-    required_files = ("qasper.jsonl",)
+    required_files = ()
+
+    def _parquet_files(self):
+        return sorted(self.root.glob("qasper/*.parquet"))
+
+    def audit(self):
+        report = super().audit()
+        if not (self.root / "qasper.jsonl").is_file() and not self._parquet_files():
+            report["missing"].append("qasper.jsonl or qasper/*.parquet")
+        report["ready"] = not report["missing"]
+        return report
 
     def _papers(self):
         self.require_files()
-        return _json_records(self.root / self.required_files[0])
+        jsonl = self.root / "qasper.jsonl"
+        if jsonl.is_file():
+            yield from _json_records(jsonl)
+            return
+        import pyarrow.parquet as pq
+
+        for path in self._parquet_files():
+            split = path.name.split("-")[0]
+            for batch in pq.ParquetFile(path).iter_batches(batch_size=64):
+                for row in batch.to_pylist():
+                    row["split"] = split
+                    yield row
 
     def iter_chunks(self):
         for paper in self._papers():
@@ -211,6 +246,10 @@ class Qasper(DatasetAdapter):
     def iter_queries(self):
         for paper in self._papers():
             paper_id = paper["id"]
+            source_split = paper.get("split")
+            split = {"train": "development", "validation": "reporting", "test": "heldout"}.get(
+                source_split, _split(paper_id)
+            )
             paragraphs = list(self._paper_paragraphs(paper))
             for qa in _rows(paper["qas"]):
                 qid = qa["question_id"]
@@ -232,7 +271,7 @@ class Qasper(DatasetAdapter):
                             raise ValueError(f"QASPER evidence does not map to paper {paper_id}")
                         qrels.update({cid: 1 for cid in matches})
                 yield (
-                    QueryRecord(dataset_id=self.id, query_id=qid, text=qa["question"], split=paper.get("split", _split(paper_id)), task="scientific_paper_question_answering", corpus_scope=paper_id),
+                    QueryRecord(dataset_id=self.id, query_id=qid, text=qa["question"], split=split, task="scientific_paper_question_answering", corpus_scope=paper_id),
                     GoldRecord(dataset_id=self.id, query_id=qid, answers=tuple(dict.fromkeys(answers)), qrels=qrels),
                 )
 
@@ -264,7 +303,11 @@ class KiltFever(DatasetAdapter):
             for output in row.get("output", []):
                 if output.get("answer"):
                     answers.append(output["answer"])
-                evidence = tuple(f"{item['wikipedia_id']}:{item['start_paragraph_id']}" for item in output.get("provenance", []))
+                evidence = tuple(
+                    f"{item['wikipedia_id']}:{paragraph}"
+                    for item in output.get("provenance", [])
+                    for paragraph in range(item["start_paragraph_id"], item.get("end_paragraph_id", item["start_paragraph_id"]) + 1)
+                )
                 if evidence:
                     evidence_sets.append(evidence)
                     qrels.update({cid: 1 for cid in evidence})

@@ -77,13 +77,18 @@ def generate_answer(query: QueryRecord, context: ContextSelection, client: Budge
     }
     input_bound = len(json.dumps(payload, ensure_ascii=False).encode())
     reply = client.post("/chat/completions", payload, max_input_tokens=input_bound,
-                        max_output_tokens=max_output_tokens, validate=validate_openrouter)
+                        max_output_tokens=max_output_tokens, validate=validate_openrouter,
+                        provenance={"query_id": query.query_id, "dataset_id": query.dataset_id})
     body = reply.body
+    if body["model"] != model:
+        raise ValueError(f"Generator resolved model {body['model']} differs from requested {model}")
     parsed = json.loads(body["choices"][0]["message"]["content"])
     if not set(parsed["citations"]) <= set(context.selected_ids):
         raise ValueError("Generator cited a chunk outside selected context")
     usage = {key: value for key, value in body.get("usage", {}).items() if type(value) is int}
+    metadata = client.generation_metadata(body["id"], reply.attempt_id) if body.get("id") else None
     return GenerationResult(query_id=query.query_id, model_requested=model,
                             model_resolved=body["model"], answer=parsed["answer"],
                             citations=tuple(parsed["citations"]), usage=usage,
-                            provider_generation_id=body.get("id"), raw_response_hash=digest(body))
+                            provider_generation_id=body.get("id"), raw_response_hash=digest(body),
+                            provider_metadata_hash=digest(metadata) if metadata else None)

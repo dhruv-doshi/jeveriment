@@ -4,6 +4,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import httpx
+import numpy as np
 import pytest
 
 from jev_eval.rag.answer import generate_answer, pack_context
@@ -12,8 +13,11 @@ from jev_eval.rag.contracts import GoldRecord, QueryRecord
 from jev_eval.rag.datasets import adapter_for
 from jev_eval.rag.evaluation import evaluate_answer, evaluate_ranking
 from jev_eval.rag.experiment import ExperimentRuntime, prepare_dataset
-from jev_eval.rag.reranking import retrieval_order, score_with_model
-from jev_eval.rag.retrieval import ChunkIndex, freeze_pool
+from jev_eval.rag.judge import judge_answer
+from jev_eval.rag.load import run_fake_load
+from jev_eval.rag.reporting import compare, export_trace_parquet, write_report
+from jev_eval.rag.reranking import retrieval_order, score_with_jev, score_with_model
+from jev_eval.rag.retrieval import ChunkIndex, DenseIndex, freeze_pool, rrf
 
 
 def _write(path, text):
@@ -48,6 +52,9 @@ def test_five_official_shape_adapters(tmp_path):
             assert not gold.qrels and "A: one" not in query.text
         if dataset == "hotpotqa":
             assert cid in gold.qrels and "given retrieval result" not in next(adapter.iter_chunks()).text
+    qasper["split"] = "validation"
+    _write(root / "qasper/qasper.jsonl", json.dumps(qasper) + "\n")
+    assert next(adapter_for("qasper", root).iter_queries())[0].split == "reporting"
 
 
 def test_retrieval_rerank_context_and_native_metrics(tmp_path):
@@ -76,6 +83,76 @@ def test_retrieval_rerank_context_and_native_metrics(tmp_path):
     assert context.selected_ids
 
 
+def test_dense_index_scope_revision_and_hybrid(tmp_path):
+    from jev_eval.io import digest
+    from jev_eval.rag.contracts import ChunkRecord
+
+    index = ChunkIndex(tmp_path / "chunks.sqlite")
+    rows = [("a", "heart disease evidence", "paper-a"),
+            ("b", "unrelated treatment", "paper-a"),
+            ("c", "heart disease evidence", "paper-b")]
+    index.add([ChunkRecord(dataset_id="qasper", document_id=scope, chunk_id=cid,
+                           text=text, text_hash=digest(text), corpus_scope=scope)
+               for cid, text, scope in rows])
+
+    class FakeEncoder:
+        name = "fixture"
+        revision = "rev-1"
+
+        def encode(self, texts, query=False):
+            return np.asarray([[1.0, 0.0] if "heart" in text else [0.0, 1.0]
+                               for text in texts], dtype=np.float32)
+
+    path = tmp_path / "dense.npy"
+    DenseIndex.build(index, path, FakeEncoder(), batch_size=2)
+    query = QueryRecord(dataset_id="qasper", query_id="q", text="heart", split="reporting",
+                        task="scientific_paper_question_answering", corpus_scope="paper-a")
+    dense = DenseIndex(index, path, FakeEncoder()).search(query, 2)
+    lexical = index.search_bm25(query, 2)
+    assert dense[0][0] == "a"
+    assert {cid for cid, _ in dense} == {"a", "b"}
+    assert rrf([[cid for cid, _ in lexical], [cid for cid, _ in dense]])[0][0] == "a"
+    wrong = FakeEncoder()
+    wrong.revision = "rev-2"
+    with pytest.raises(ValueError, match="different embedding model"):
+        DenseIndex(index, path, wrong)
+
+
+def test_parallel_jev_scores_exact_frozen_pool(tmp_path):
+    from jev_eval.io import digest
+    from jev_eval.rag.contracts import ChunkRecord
+
+    index = ChunkIndex(tmp_path / "chunks.sqlite")
+    index.add([ChunkRecord(dataset_id="qasper", document_id="paper", chunk_id=f"c{i}",
+                           text=f"evidence {i}", text_hash=digest(f"evidence {i}"), corpus_scope="paper")
+               for i in range(4)])
+    query = QueryRecord(dataset_id="qasper", query_id="q", text="evidence", split="reporting",
+                        task="scientific_paper_question_answering", corpus_scope="paper")
+    pool = freeze_pool(query, "bm25", [(f"c{i}", 4 - i) for i in range(4)], index, 4)
+
+    def respond(request):
+        data = json.loads(request.content)
+        cid = data["state"]["document"]["id"]
+        resolved = "different-model" if data["model"] == "mismatch" else data["model"]
+        return httpx.Response(200, json={"model": resolved,
+                                         "answers": {"relevance": {"type": "noul", "noul": int(cid[-1]) / 3}},
+                                         "usage": {"input_tokens": 40, "output_tokens": 3}})
+
+    client = BudgetedHTTP(provider="typesafe", root=tmp_path / "run", token="fixture-secret",
+                          base_url="https://fixture.invalid", budget_usd=Decimal("1"),
+                          max_tokens=10000, max_requests=10,
+                          input_usd_per_million=Decimal("0.1"), output_usd_per_million=Decimal("0.1"),
+                          rpm=100, tpm=10000, inflight=2, transport=httpx.MockTransport(respond))
+    first = score_with_jev(query, pool, index, client, model="fixture-jev", workers=4)
+    second = score_with_jev(query, pool, index, client, model="fixture-jev", workers=4)
+    assert first.ordered_ids == ("c3", "c2", "c1", "c0")
+    assert second.ordered_ids == first.ordered_ids
+    assert len(first.raw_response_paths) == 4
+    assert client._ledger().totals()["attempts"] == 4
+    with pytest.raises(ValueError, match="differs from requested"):
+        score_with_jev(query, pool, index, client, model="mismatch", workers=2)
+
+
 def test_budgeted_generator_records_request_and_checks_citations(tmp_path):
     from jev_eval.rag.contracts import ContextSelection
 
@@ -84,6 +161,10 @@ def test_budgeted_generator_records_request_and_checks_citations(tmp_path):
     seen = []
 
     def respond(request):
+        if request.method == "GET":
+            return httpx.Response(200, json={"data": {"id": "g1", "total_cost": 0.00005,
+                                                      "latency": 1250, "generation_time": 1200,
+                                                      "provider_name": "fixture-provider"}})
         seen.append(json.loads(request.content))
         return httpx.Response(200, json={"id": "g1", "model": "moonshotai/kimi-k2.5", "choices": [{"message": {"content": json.dumps({"answer": "A", "citations": ["c1"]})}}], "usage": {"prompt_tokens": 50, "completion_tokens": 5}})
 
@@ -94,12 +175,41 @@ def test_budgeted_generator_records_request_and_checks_citations(tmp_path):
                           rpm=100, tpm=100000, inflight=2, transport=httpx.MockTransport(respond))
     result = generate_answer(query, context, client, "moonshotai/kimi-k2.5", "fixture-provider")
     assert result.answer == "A" and result.citations == ("c1",)
+    assert result.provider_metadata_hash
     assert seen[0]["provider"]["allow_fallbacks"] is False
     assert "Options:" in seen[0]["messages"][1]["content"]
     assert "test-secret" not in "".join(p.read_text() for p in (tmp_path / "run/raw").rglob("*.json"))
     gold = GoldRecord(dataset_id="mirage", query_id="q", answers=("A",))
     assert evaluate_answer(result, gold, context)["answer_exact_match"] == 1
     assert client.ledger_path.exists()
+
+
+def test_optional_judge_is_metered_and_replayable(tmp_path):
+    from jev_eval.rag.contracts import ContextSelection, GenerationResult
+
+    query = QueryRecord(dataset_id="qasper", query_id="q", text="What happened?", split="reporting", task="scientific_paper_question_answering")
+    context = ContextSelection(query_id="q", selected_ids=("p:0",), dropped_ids=(), text="[p:0] A happened", estimated_tokens=5, budget_tokens=100)
+    answer = GenerationResult(query_id="q", model_requested="m", model_resolved="m", answer="A", citations=("p:0",), raw_response_hash="h")
+    gold = GoldRecord(dataset_id="qasper", query_id="q", answers=("A",))
+    calls = []
+
+    def respond(request):
+        calls.append(request.method)
+        if request.method == "GET":
+            return httpx.Response(200, json={"data": {"id": "judge1", "total_cost": 0.0001}})
+        content = {"faithfulness": 0.9, "answer_relevancy": 1.0, "answer_correctness": 0.8, "rationale": "Supported"}
+        return httpx.Response(200, json={"id": "judge1", "model": "m", "choices": [{"message": {"content": json.dumps(content)}}],
+                                         "usage": {"prompt_tokens": 20, "completion_tokens": 10}})
+
+    client = BudgetedHTTP(provider="openrouter", root=tmp_path / "judge", token="fixture",
+                          base_url="https://openrouter.ai/api/v1", budget_usd=Decimal("1"),
+                          max_tokens=100000, max_requests=10, input_usd_per_million=Decimal("0.45"),
+                          output_usd_per_million=Decimal("2.25"), rpm=100, tpm=100000,
+                          inflight=2, transport=httpx.MockTransport(respond))
+    first = judge_answer(query, context, answer, gold, client, "m", "fixture-provider")
+    second = judge_answer(query, context, answer, gold, client, "m", "fixture-provider")
+    assert first.faithfulness == second.faithfulness == 0.9
+    assert calls == ["POST", "GET"]
 
 
 def test_missing_sources_fail_closed(tmp_path):
@@ -109,7 +219,7 @@ def test_missing_sources_fail_closed(tmp_path):
         list(adapter.iter_queries())
 
 
-def test_parallel_run_and_replay_without_provider_calls(tmp_path):
+def test_parallel_run_and_replay_without_provider_calls(tmp_path, monkeypatch, capsys):
     from jev_eval.rag.config import load_experiment
 
     spec = load_experiment("configs/rag/experiment.yaml")
@@ -128,3 +238,41 @@ def test_parallel_run_and_replay_without_provider_calls(tmp_path):
     assert all(not row["cache"]["rerank"] for row in first_rows)
     assert all(row["cache"]["rerank"] for row in second_rows)
     assert [row["ranking"] for row in first_rows] == [row["ranking"] for row in second_rows]
+    report = write_report([first["path"]], tmp_path / "runs" / spec.experiment_id, tmp_path / "report.json")
+    assert report["quality"]["mirage/bm25/retrieval_order"]["attempted"] == 3
+    assert report["stage_latency_ms"]["retrieve"]["count"] == 3
+    exported = export_trace_parquet(tmp_path / "runs" / spec.experiment_id, tmp_path / "parquet")
+    assert exported["stages"] >= 3 and (tmp_path / "parquet/stages.parquet").exists()
+    from jev_eval.cli import main
+
+    monkeypatch.setattr("jev_eval.rag.telemetry.setup_tracing", lambda root: None)
+    monkeypatch.setattr("sys.argv", ["jev-eval", "rag", "matrix", "configs/rag/experiment.yaml",
+                                     "--datasets", "mirage", "--retrievers", "bm25",
+                                     "--rerankers", "retrieval_order", "--run-root", str(tmp_path / "runs"),
+                                     "--split", "reporting", "--limit", "2", "--workers", "2", "--execute"])
+    main()
+    executed = json.loads(capsys.readouterr().out)
+    assert executed["cells"] == 1 and executed["results"][0]["queries"] == 2
+    assert executed["results"][0]["workers"] == 2
+
+
+def test_fake_load_retries_and_records_tail_latency(tmp_path):
+    result = run_fake_load(tmp_path, requests=12, workers=4, latency_ms=1, every_429=4)
+    assert result["successes"] == 12
+    assert result["attempts"] > result["requests"]
+    assert result["end_to_end_ms"]["count"] == 12
+    assert result["end_to_end_ms"]["p99_low_sample_warning"]
+
+
+def test_paired_comparison_rejects_different_candidate_pools(tmp_path):
+    baseline = tmp_path / "baseline.json"
+    challenger = tmp_path / "challenger.json"
+    row = {"dataset": "qasper", "retriever": "bm25", "reranker": "baseline",
+           "query_id": "q1", "pool_hash": "same", "ranking": {"ndcg@10": 0.5}}
+    baseline.write_text(json.dumps([row]))
+    challenger.write_text(json.dumps([{**row, "reranker": "challenger", "ranking": {"ndcg@10": 0.8}}]))
+    result = compare([baseline], [challenger], "ranking.ndcg@10", bootstrap=100, permutations=100)
+    assert result["paired"]["macro_delta"] == pytest.approx(0.3)
+    challenger.write_text(json.dumps([{**row, "pool_hash": "different"}]))
+    with pytest.raises(ValueError, match="Candidate pool mismatch"):
+        compare([baseline], [challenger], "ranking.ndcg@10", bootstrap=10, permutations=10)

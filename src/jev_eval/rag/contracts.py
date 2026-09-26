@@ -95,6 +95,9 @@ class StageRecord(StrictModel):
     status: Literal["success", "failed", "skipped"]
     mode: Literal["live", "replay", "fixture"]
     elapsed_ms: float = Field(ge=0)
+    started_at_utc: str | None = None
+    finished_at_utc: str | None = None
+    trace_id: str | None = None
     error: str | None = None
 
 
@@ -105,6 +108,7 @@ class RerankResult(StrictModel):
     ordered_ids: tuple[str, ...]
     scores: dict[str, float]
     raw_response_hashes: dict[str, str] = Field(default_factory=dict)
+    raw_response_paths: dict[str, str] = Field(default_factory=dict)
     missing_ids: tuple[str, ...] = ()
 
     @model_validator(mode="after")
@@ -113,6 +117,8 @@ class RerankResult(StrictModel):
             raise ValueError("Duplicate reranked IDs")
         if set(self.scores) | set(self.missing_ids) != set(self.ordered_ids):
             raise ValueError("Reranker IDs do not match pool")
+        if self.raw_response_paths and set(self.raw_response_paths) != set(self.scores):
+            raise ValueError("Raw response paths do not cover scored IDs")
         return self
 
 
@@ -134,4 +140,17 @@ class GenerationResult(StrictModel):
     usage: dict[str, int] = Field(default_factory=dict)
     provider_generation_id: str | None = None
     provider_timing_ms: float | None = None
+    provider_metadata_hash: str | None = None
     raw_response_hash: str
+
+
+class JudgeResult(StrictModel):
+    query_id: str
+    model_requested: str
+    model_resolved: str
+    faithfulness: float = Field(ge=0, le=1)
+    answer_relevancy: float = Field(ge=0, le=1)
+    answer_correctness: float | None = Field(default=None, ge=0, le=1)
+    rationale: str
+    raw_response_hash: str
+    provider_metadata_hash: str | None = None

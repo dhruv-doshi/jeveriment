@@ -8,6 +8,7 @@ class QwenEncoder:
                  task="Retrieve passages that contain evidence for answering the question"):
         if not revision:
             raise ValueError("Embedding revision must be pinned")
+        self.name, self.revision = name, revision
         import torch
         from transformers import AutoModel, AutoTokenizer
 

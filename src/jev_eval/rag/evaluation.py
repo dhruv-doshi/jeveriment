@@ -38,8 +38,20 @@ def evaluate_answer(result: GenerationResult, gold: GoldRecord, context: Context
               "used_evidence_tokens": context.estimated_tokens}
     if gold.qrels:
         positives = {cid for cid, grade in gold.qrels.items() if grade > 0}
-        output["context_evidence_recall"] = len(positives & set(context.selected_ids)) / len(positives) if positives else None
-        output["citation_evidence_precision"] = len(positives & set(result.citations)) / len(result.citations) if result.citations else None
+        selected, cited = set(context.selected_ids), set(result.citations)
+        output["context_evidence_recall"] = len(positives & selected) / len(positives) if positives else None
+        precision = len(positives & cited) / len(cited) if cited else 0.0
+        recall = len(positives & cited) / len(positives) if positives else 0.0
+        output["citation_evidence_precision"] = precision
+        output["citation_evidence_recall"] = recall
+        output["citation_evidence_f1"] = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+        if gold.evidence_sets:
+            output["complete_evidence_set_in_context"] = float(any(set(group) <= selected for group in gold.evidence_sets))
+            output["complete_evidence_set_cited"] = float(any(set(group) <= cited for group in gold.evidence_sets))
+        if gold.dataset_id == "kilt_fever":
+            gold_pages = {cid.rsplit(":", 1)[0] for cid in positives}
+            cited_pages = {cid.rsplit(":", 1)[0] for cid in cited}
+            output["provenance_page_recall"] = len(gold_pages & cited_pages) / len(gold_pages)
     else:
         output["context_evidence_recall"] = None
         output["citation_evidence_precision"] = None
@@ -49,4 +61,11 @@ def evaluate_answer(result: GenerationResult, gold: GoldRecord, context: Context
     output["answer_applicable"] = True
     output["answer_exact_match"] = float(any(normalize(result.answer) == normalize(ref) for ref in gold.answers))
     output["answer_token_f1"] = max(token_f1(result.answer, ref) for ref in gold.answers)
+    if gold.dataset_id in {"mirage", "kilt_fever"}:
+        output["answer_accuracy"] = output["answer_exact_match"]
+    if gold.dataset_id == "hotpotqa" and "citation_evidence_f1" in output:
+        output["joint_answer_support_f1"] = output["answer_token_f1"] * output["citation_evidence_f1"]
+    if gold.dataset_id == "qasper":
+        output["gold_unanswerable"] = float(any(normalize(ref) == "unanswerable" for ref in gold.answers))
+        output["predicted_unanswerable"] = float(normalize(result.answer) == "unanswerable")
     return output

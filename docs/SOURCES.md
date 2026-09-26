@@ -1,0 +1,13 @@
+# Benchmark source layout
+
+The adapters read official files from `data/sources/<dataset>/`. They do not create labels or use a benchmark's supplied retrieval pool as the corpus. `jev-eval rag audit-sources configs/rag/experiment.yaml` lists missing inputs. Preparation hashes source files and verifies that all gold evidence IDs map to indexed chunks; it stops on a mismatch.
+
+| Dataset | Local inputs | Official source and interpretation |
+|---|---|---|
+| MIRAGE | `mirage/benchmark.json` plus `mirage/medrag/**/chunk/*.jsonl` from one pinned MedRAG corpus, or a concatenated `mirage/medrag_corpus.jsonl` | [MIRAGE benchmark](https://github.com/gzxiong/MIRAGE), [MedRAG corpus format](https://github.com/gzxiong/MedRAG). Retrieval sees only the question. Options are passed to the generator after retrieval. MIRAGE has no universal passage qrels. |
+| CLERC | `clerc/collection/collection.passage.tsv.gz`, `clerc/queries/test.single-removed.direct.tsv`, `clerc/qrels/qrels-passage.test.direct.tsv` | [CLERC files](https://huggingface.co/datasets/jhu-clsp/CLERC/tree/main). The passage collection is the corpus; the 20 sampled negatives in generation rows are not. This adapter scores direct passage retrieval. The retrieval split has no reference legal answer; final answer accuracy is unavailable. |
+| HotpotQA | `hotpotqa/hotpot_dev_fullwiki_v1.json`, plus `hotpotqa/wiki.jsonl` with one full-Wikipedia article per line as `{title, sentences}` | [Official fullwiki task](https://github.com/hotpotqa/hotpot). The development file's `context` field contains previously retrieved paragraphs and is not the full corpus. `wiki.jsonl` must come from a pinned compatible Wikipedia corpus and preserve each article's sentence numbering. The repository does not ship or generate this large corpus. |
+| QASPER | `qasper/qasper.jsonl` (one official paper record per line) or the official `qasper/qasper/*.parquet` snapshot | [QASPER dataset](https://huggingface.co/datasets/allenai/qasper). Retrieval is restricted to the target paper. Evidence text must map to its paragraphs. |
+| KILT-FEVER | `kilt_fever/kilt_knowledgesource.json`, `kilt_fever/fever-dev-kilt.jsonl` | [KILT data and Wikipedia snapshot](https://github.com/facebookresearch/KILT). Use KILT's 2019 snapshot; another Wikipedia dump will fail provenance mapping. |
+
+Download and store corpora outside Git. Before hosted inference, record the exact source revision, applicable data terms, and whether sending passages to TypeSafe/OpenRouter is permitted for that source. MIRAGE's chosen MedRAG corpus and HotpotQA's matching fullwiki corpus need a source/version decision before a real five-dataset run. The source audit command checks file presence; it does not establish rights or corpus compatibility by itself.

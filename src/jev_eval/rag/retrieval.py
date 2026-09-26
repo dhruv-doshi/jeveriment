@@ -3,11 +3,12 @@
 import re
 import sqlite3
 import threading
+import uuid
 from pathlib import Path
 
 import numpy as np
 
-from jev_eval.io import digest
+from jev_eval.io import digest, read_json, write_json
 
 from .contracts import CandidatePool, CandidateRecord, ChunkRecord, QueryRecord
 
@@ -119,8 +120,14 @@ class DenseIndex:
     def __init__(self, index: ChunkIndex, vector_path: str | Path, encoder):
         self.index, self.vector_path, self.encoder = index, Path(vector_path), encoder
         self.ids = index.all_ids()
+        self.id_to_row = {cid: row for row, cid in enumerate(self.ids)}
+        meta = read_json(self.vector_path.with_suffix(".meta.json"))
+        if meta["ids_hash"] != digest(self.ids):
+            raise ValueError("Dense index row mapping differs from chunk index")
+        if meta.get("encoder") != {"name": getattr(encoder, "name", None), "revision": getattr(encoder, "revision", None)}:
+            raise ValueError("Dense index was built with a different embedding model or revision")
         self.vectors = np.load(self.vector_path, mmap_mode="r")
-        if len(self.ids) != len(self.vectors):
+        if len(self.ids) != len(self.vectors) or self.vectors.shape[1] != meta["dimension"]:
             raise ValueError("Dense vector and chunk row counts differ")
         self.faiss_index = None
         try:
@@ -139,10 +146,13 @@ class DenseIndex:
             raise ValueError("Cannot embed an empty corpus")
         vector_path = Path(vector_path)
         vector_path.parent.mkdir(parents=True, exist_ok=True)
+        if vector_path.exists() or vector_path.with_suffix(".meta.json").exists():
+            raise FileExistsError("Dense index already exists; use a new run ID for changed inputs")
+        pending = vector_path.with_name(f".{vector_path.stem}.pending-{uuid.uuid4().hex}.npy")
         first = np.asarray(encoder.encode([index.get(ids[0]).text]), dtype=np.float32)
         if first.ndim != 2 or first.shape[0] != 1 or not np.isfinite(first).all():
             raise ValueError("Invalid encoder output")
-        matrix = np.lib.format.open_memmap(vector_path, mode="w+", dtype=np.float32, shape=(len(ids), first.shape[1]))
+        matrix = np.lib.format.open_memmap(pending, mode="w+", dtype=np.float32, shape=(len(ids), first.shape[1]))
         try:
             import faiss
 
@@ -165,15 +175,24 @@ class DenseIndex:
                 faiss_index.add(batch)
         matrix.flush()
         if faiss_index is not None:
-            faiss.write_index(faiss_index, str(vector_path.with_suffix(".faiss")))
-        return {"count": len(ids), "dimension": matrix.shape[1], "ids_hash": digest(ids)}
+            faiss.write_index(faiss_index, str(pending.with_suffix(".faiss")))
+        meta = {"count": len(ids), "dimension": matrix.shape[1], "ids_hash": digest(ids),
+                "encoder": {"name": getattr(encoder, "name", None), "revision": getattr(encoder, "revision", None)}}
+        pending.replace(vector_path)
+        pending_faiss = pending.with_suffix(".faiss")
+        if pending_faiss.exists():
+            pending_faiss.replace(vector_path.with_suffix(".faiss"))
+        write_json(vector_path.with_suffix(".meta.json"), meta)
+        return meta
 
     def search(self, query: QueryRecord, depth: int):
         vector = np.asarray(self.encoder.encode([query.text], query=True)[0], dtype=np.float32)
-        vector /= np.linalg.norm(vector)
+        norm = np.linalg.norm(vector)
+        if not np.isfinite(vector).all() or not np.isfinite(norm) or norm == 0:
+            raise ValueError("Invalid query embedding")
+        vector /= norm
         if query.corpus_scope is not None:
-            allowed = set(self.index.all_ids(query.corpus_scope))
-            rows = np.array([i for i, cid in enumerate(self.ids) if cid in allowed])
+            rows = np.array([self.id_to_row[cid] for cid in self.index.all_ids(query.corpus_scope)], dtype=np.int64)
             scores = np.asarray(self.vectors[rows]) @ vector
             hits = [(self.ids[rows[i]], float(scores[i])) for i in range(len(rows))]
         elif self.faiss_index is not None:

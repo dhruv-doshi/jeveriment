@@ -15,7 +15,7 @@ QWEN_PREFIX = '<|im_start|>system\nJudge whether the Document meets the requirem
 QWEN_SUFFIX = '<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n'
 
 
-def _ordered(pool, scores, reranker_id, raw=None):
+def _ordered(pool, scores, reranker_id, raw=None, paths=None):
     expected = [item.chunk_id for item in pool.candidates]
     if set(scores) != set(expected) or any(not math.isfinite(v) for v in scores.values()):
         raise ValueError("Reranker must return one finite score per frozen candidate")
@@ -23,7 +23,7 @@ def _ordered(pool, scores, reranker_id, raw=None):
     ordered = sorted(expected, key=lambda cid: (-scores[cid], original[cid]))
     return RerankResult(query_id=pool.query_id, pool_hash=pool.ordered_hash,
                         reranker_id=reranker_id, ordered_ids=tuple(ordered),
-                        scores=scores, raw_response_hashes=raw or {})
+                        scores=scores, raw_response_hashes=raw or {}, raw_response_paths=paths or {})
 
 
 def retrieval_order(pool: CandidatePool):
@@ -90,11 +90,11 @@ def jev_score_payload(query: QueryRecord, chunk, model: str):
 
 
 def score_with_jev(query: QueryRecord, pool: CandidatePool, index, client: BudgetedHTTP,
-                   model: str | None = None, workers=4):
+                   model: str | None = None, workers=4, executor=None):
     model = model or os.getenv("JEV_MODEL")
     if not model:
         raise ValueError("JEV_MODEL is required for live JEV scoring")
-    scores, raw = {}, {}
+    scores, raw, paths = {}, {}, {}
 
     def one(item):
         chunk = index.get(item.chunk_id)
@@ -104,13 +104,28 @@ def score_with_jev(query: QueryRecord, pool: CandidatePool, index, client: Budge
         # UTF-8 bytes are a conservative upper bound for input token count.
         input_bound = len(json.dumps(payload, ensure_ascii=False).encode())
         reply = client.post("/v1/systemone", payload, max_input_tokens=input_bound,
-                            max_output_tokens=64, validate=validate_jev)
-        return item.chunk_id, float(reply.body["answers"]["relevance"]["noul"]), digest(reply.body)
+                            max_output_tokens=64, validate=validate_jev,
+                            provenance={"query_id": query.query_id, "dataset_id": query.dataset_id,
+                                        "chunk_id": chunk.chunk_id, "reranker": "jev"})
+        if reply.body["model"] != model:
+            raise ValueError(f"JEV resolved model {reply.body['model']} differs from requested {model}")
+        return item.chunk_id, float(reply.body["answers"]["relevance"]["noul"]), digest(reply.body), reply.raw_path
 
-    with ThreadPoolExecutor(max_workers=workers) as executor:
+    own_pool = executor is None
+    executor = executor or ThreadPoolExecutor(max_workers=workers)
+    futures = []
+    try:
         futures = [executor.submit(one, item) for item in pool.candidates]
         for future in as_completed(futures):
-            cid, score, response_hash = future.result()
+            cid, score, response_hash, raw_path = future.result()
             scores[cid] = score
             raw[cid] = response_hash
-    return _ordered(pool, scores, "jev", raw)
+            paths[cid] = raw_path
+    except Exception:
+        for future in futures:
+            future.cancel()
+        raise
+    finally:
+        if own_pool:
+            executor.shutdown(wait=True)
+    return _ordered(pool, scores, "jev", raw, paths)

@@ -2,6 +2,8 @@
 
 import fcntl
 from collections.abc import Callable
+from contextlib import nullcontext
+from datetime import datetime, timezone
 from time import monotonic
 
 from jev_eval.io import digest
@@ -33,15 +35,31 @@ def execute_stage(
             return store.get(cached.output_hash), cached, True
         input_hash = store.put(input_value)
         started = monotonic()
+        started_at = datetime.now(timezone.utc).isoformat()
         try:
-            output = call(input_value)
-        except Exception as exc:
-            error = {"type": type(exc).__name__, "message": str(exc)}
-            store.put(error)
-            from jev_eval.io import write_json
+            from opentelemetry import trace
 
-            write_json(store.root / "failures" / f"{key}.json", error)
-            raise
+            span_scope = trace.get_tracer("jev_eval.rag").start_as_current_span(f"rag.{stage}")
+        except ImportError:
+            span_scope = nullcontext(None)
+        with span_scope as span:
+            if span is not None:
+                span.set_attribute("rag.stage", stage)
+                span.set_attribute("rag.plugin", plugin_id)
+                span.set_attribute("rag.run_id", run_id)
+            try:
+                output = call(input_value)
+            except Exception as exc:
+                error = {"type": type(exc).__name__, "message": str(exc)}
+                store.put(error)
+                from jev_eval.io import write_json
+
+                write_json(store.root / "failures" / f"{key}.json", error)
+                if span is not None:
+                    span.record_exception(exc)
+                raise
+            context = span.get_span_context() if span is not None else None
+            trace_id = f"{context.trace_id:032x}" if context and context.is_valid else None
         output_hash = store.put(output)
         record = StageRecord(
             run_id=run_id,
@@ -55,6 +73,9 @@ def execute_stage(
             status="success",
             mode=mode,
             elapsed_ms=(monotonic() - started) * 1000,
+            started_at_utc=started_at,
+            finished_at_utc=datetime.now(timezone.utc).isoformat(),
+            trace_id=trace_id,
         )
         store.record(key, record)
         return output, record, False

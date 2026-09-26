@@ -1,6 +1,6 @@
 # JEV in production-style RAG: implementation plan
 
-**Status:** complete implementation plan; clean branch foundation in progress
+**Status:** implementation in development; full benchmark and provider load run pending
 
 **Updated:** 2026-09-26
 
@@ -8,7 +8,7 @@
 
 **Scope:** five existing benchmarks, pluggable retrieval and reranking, fixed primary generation comparisons, quality and operational evaluation
 
-**Execution state:** branch cleanup and the configuration/artifact foundation are underway. Development tests are authorized. The complete five-dataset evaluation and live-provider load test require a later explicit instruction from the owner; neither has begun.
+**Execution state:** the pipeline and local fixture tests are implemented. Official source snapshots, local model weights, account-specific limits, and live provider preflight are not yet verified. The complete five-dataset evaluation and live-provider load test require a later explicit instruction from the owner; neither has begun.
 
 ## 1. Purpose and claim boundary
 
@@ -56,7 +56,7 @@ All arrows write versioned input/output records and trace spans.
 | Reranker | Score/order the saved pool, preserving candidate IDs and failures | No rerank, MiniLM, BGE, Qwen, simple JEV | Variable |
 | Context selector | Deduplicate and pack ranked chunks into a fixed token budget | Deterministic rank-order packer | Yes initially |
 | Generator | Produce answer and citations from question + selected context | OpenRouter primary adapter with one fixed model; local adapter optional | Yes |
-| Evaluator | Compute applicable native IR/answer metrics and supplemental RAG metrics | Native scripts, `ir_measures`, Ragas | Yes |
+| Evaluator | Compute applicable native IR/answer metrics and supplemental RAG metrics | Native metrics, fixed optional metered judge | Yes |
 | Trace sink | Persist each stage's inputs, outputs, usage, attempts, timing, errors | Local structured artifacts, OpenTelemetry spans | Always on |
 
 The service boundary exposes a single versioned `answer(query, dataset_or_corpus, retrieval, reranker, generator)` request. Experiment configuration specifies plugin IDs and parameters; code does not branch on a particular benchmark or reranker name outside its adapter. A plugin registry validates capabilities before execution: e.g. a metric requiring evidence annotations is unavailable on a benchmark without them.
@@ -126,7 +126,7 @@ The source audit verifies every proposed split and the generator–retrieval que
 
 Start with three explicit arms using the same corpus/chunks and query text:
 
-1. **Lexical:** Lucene BM25 via Pyserini, with index settings and analyzer recorded.
+1. **Lexical:** SQLite FTS5 BM25, with tokenizer and index settings recorded. This keeps scoped retrieval and the chunk store in one index; a Lucene/Pyserini arm can be added as a separate retrieval plugin for sensitivity analysis.
 2. **Dense:** pinned Qwen3-Embedding-0.6B model, batched document/query encoding, cosine or dot-product normalization recorded, FAISS index with exact-search validation on a sample. This reuses the project's existing embedding baseline; it is not labeled universal SOTA.
 3. **Hybrid:** reciprocal-rank fusion of lexical and dense rankings at a fixed predeclared depth/constant. RRF belongs to retrieval/fusion, not the reranker list.
 
@@ -178,10 +178,10 @@ The **generator** is the language model that reads the question and the evidence
 | Reranked list | nDCG@5/10, MRR@10, MAP@10, Recall@5/10, Precision@5/10, hit@10, judged@10, positive rank distribution | On datasets with mapped relevance labels. Report binary or graded gain explicitly; never conflate unjudged with irrelevant without saying so. |
 | Packed context | Gold-evidence coverage/recall and F1, unique-source coverage, redundancy, used/available tokens, citation-source validity | Evaluate the chunks actually passed to generator, including evidence-set completeness on multi-hop tasks. |
 | Final answer | Native accuracy, EM/token F1, supporting-fact F1, evidence/provenance F1, unanswerable precision/recall, citation precision/recall where references exist | Dataset-specific. CLERC's legal text needs its native task scoring and a bounded blind human review for correctness; lexical overlap alone is weak. |
-| Supplemental RAG | Ragas context precision/recall, faithfulness, answer relevancy/correctness when inputs support them | LLM-judged diagnostics; separate from native primary endpoints. Pin judge model/prompt and test agreement on a stratified human-reviewed sample. |
+| Supplemental RAG | Context evidence precision/recall/F1, faithfulness, answer relevancy/correctness when references exist | A fixed OpenRouter judge is optional and metered through the same budget ledger; native metrics remain primary. Pin the judge model/prompt and test agreement on a stratified human-reviewed sample. |
 | Reliability | End-to-end success, format failures, abstentions, fallbacks, incorrect citations, unsupported claims, error categories | Always report on all attempted queries, including failures. |
 
-Native evaluators are authoritative when available; `ir_measures` computes standard ranked retrieval metrics. Ragas augments final-answer analysis, with cost and judge variance reported. For legal and medical outputs, add a **small, prespecified, blinded** human audit of factual support and harmful/unsupported claims if the claims extend beyond native benchmark scores; this is an audit, not a new dataset-building effort. Reviewers see paired outputs without reranker names. If no human review is done, narrow the article's claims accordingly.
+Native evaluators are authoritative when available; local metric functions compute standard ranked retrieval metrics. The optional fixed judge augments final-answer analysis, with cost and judge variance reported. For legal and medical outputs, add a **small, prespecified, blinded** human audit of factual support and harmful/unsupported claims if the claims extend beyond native benchmark scores; this is an audit, not a new dataset-building effort. Reviewers see paired outputs without reranker names. If no human review is done, narrow the article's claims accordingly.
 
 Statistical analysis: paired per-query deltas within each fixed candidate pool, bootstrap confidence intervals clustered by query (and paper/case when multiple questions share a source), Holm-adjusted comparisons for the declared primary endpoint, and effect sizes alongside p-values. Predeclare one primary endpoint per task family (MIRAGE accuracy, HotpotQA answer + support, QASPER answer/evidence, FEVER label/evidence, CLERC citation/evidence retrieval plus audited final answer) and treat the rest as diagnostics. Publish per-dataset regressions and examples, not only an aggregate win rate. Report quality against fixed token/cost/latency budgets and a Pareto frontier.
 
@@ -208,11 +208,11 @@ Forecast calls as `sum(query × retriever arm × unique candidate pairs)` for po
 
 At TypeSafe's [publicly stated $0.042 per million input tokens](https://typesafe.ai/blog/introducing-system-one-models-and-jev), 300,000 independent pairs averaging 512 billed input tokens would be about 153.6 million tokens, or **$6.45 for JEV input alone**. This is an illustration, not a run quote: actual prompt length, unique-pair overlap, retries, account credits, model pricing, OpenRouter generations/judges, and infrastructure change the total. The preflight must obtain an account-specific price/rate snapshot and a measured token distribution on a tiny development sample, then produce a per-stage upper-bound forecast before any paid batch. A $50 cap does not imply that all five complete datasets can be fully scored and generated; report exact coverage if the cap binds.
 
-The planned comparison matrix is five datasets × three retrieval arms × five reranker arms (75 ranking cells), with the **same query IDs per dataset across its cells**. Stage 1 may compute local retrieval metrics on larger scoreable sets without JEV or generator spend. Stage 2 uses a deterministic, stratified matched subset for all five rerankers; target at least 200 eligible questions per dataset where available, then size the final sample using observed paired variance and the remaining budget before freezing it. Stage 3 generates answers for those same matched cells and uses Ragas judges only on a prespecified subset. A reduced sample is reported as reduced coverage, not a complete-dataset result. The full matrix and any live load profile are part of the owner-triggered experiment, not development testing.
+The planned comparison matrix is five datasets × three retrieval arms × five reranker arms (75 ranking cells), with the **same query IDs per dataset across its cells**. Stage 1 may compute local retrieval metrics on larger scoreable sets without JEV or generator spend. Stage 2 uses a deterministic, stratified matched subset for all five rerankers; target at least 200 eligible questions per dataset where available, then size the final sample using observed paired variance and the remaining budget before freezing it. Stage 3 generates answers for those same matched cells and applies the optional fixed judge only on a prespecified subset. A reduced sample is reported as reduced coverage, not a complete-dataset result. The full matrix and any live load profile are part of the owner-triggered experiment, not development testing.
 
 ## 10. Rate limits and load methodology
 
-The TypeSafe adapter uses one account-wide async limiter shared by all workers: requests/minute and tokens/minute if known, bounded in-flight concurrency, idempotent retry rules, jittered exponential backoff honoring `Retry-After`, circuit breaking for sustained faults, and per-attempt budget accounting. Discover published/account-specific limits before tuning concurrency; an absent published number is recorded as unknown, not guessed. Rate limits may be dynamic, so a bounded calibration ramp measures observed throttling.
+The TypeSafe adapter uses one SQLite-backed account-wide limiter shared by parallel workers and processes: requests/minute and tokens/minute if known, bounded in-flight concurrency, idempotent retry rules, jittered exponential backoff honoring `Retry-After`, circuit breaking for sustained faults, and per-attempt budget accounting. Discover published/account-specific limits before tuning concurrency; an absent published number is recorded as unknown, not guessed. Rate limits may be dynamic, so a bounded calibration ramp measures observed throttling.
 
 Load phases, after offline quality passes: single-user baseline; controlled concurrency ramp; sustained steady state; burst and recovery; provider slowdown/429/timeout fault injection; local model cold start and process restart. Use fixed query-mix and length strata from the five datasets. Preserve a clean benchmark mode with no induced faults. Run stress tests within provider terms and an approved spend ceiling. Define p95/p99 and availability SLOs before making any production-readiness claim. Report maximum sustainable throughput at the stated quality/error target, not just peak launch rate.
 
@@ -221,41 +221,45 @@ Load phases, after offline quality passes: single-user baseline; controlled conc
 | Need | Selected tool and role |
 |---|---|
 | Experiment/config/data contracts | Python, `uv` lockfile, Pydantic schemas, YAML run manifests; reuse the repository's existing `jev_eval` code where sound. |
-| RAG composition | LangChain adapters for familiar retriever/generator integration; canonical records and ranking logic remain framework-neutral so a framework update cannot erase scores/IDs. |
+| RAG composition | Framework-neutral plugin contracts and deterministic stage records. LangChain integration can be added as a separate adapter without changing IDs or scores. |
 | Dataset loading | Official files and Hugging Face `datasets` where appropriate; adapter pins revisions and validates schema. |
-| Index/retrieval | Pyserini/Lucene BM25, FAISS dense index, Qwen3 embedding model, deterministic RRF fusion. Record all index/model versions. |
+| Index/retrieval | SQLite FTS5 BM25, FAISS dense index, Qwen3 embedding model, deterministic RRF fusion. Record all index/model versions. |
 | Reranking | `sentence-transformers`/Transformers for local cross-encoders; direct `httpx` for TypeSafe JEV so response/attempt details remain observable. |
-| Metrics | Official benchmark scripts + `ir_measures`; Ragas for supplemental RAG metrics. |
-| Trace/analysis | OpenTelemetry spans; immutable JSON blobs + Parquet tables; DuckDB for queryable reports and plots. Optional LangSmith export if desired, never required for the canonical record. |
+| Metrics | Native benchmark and IR metrics implemented locally; a fixed, metered OpenRouter judge for optional supplemental RAG metrics. |
+| Trace/analysis | OpenTelemetry spans; immutable JSON blobs + Parquet tables; JSON reports. Optional hosted tracing export can be added without changing the canonical record. |
 | Primary generation | Direct OpenRouter chat completion adapter using `httpx`, with `usage` requested, generation metadata reconciliation, fixed model/provider routing, and local artifact recording. |
 | Service/load | FastAPI for an answer endpoint; Locust for repeatable ramp and burst profiles; standard host/GPU telemetry. |
 
-Exact dependency versions and container image digest are pinned when implementation starts. `LangChain`, `Ragas`, and `LangSmith` are not used as interchangeable “evaluation frameworks”: LangChain composes calls, Ragas computes optional answer metrics, and LangSmith is optional hosted trace inspection. The canonical artifact store is local/exportable, so experiments do not depend on a paid tracing service.
+Exact dependency versions are pinned in `uv.lock`; a container image digest is pinned if the later run uses one. The canonical artifact store is local/exportable, so experiments do not depend on a hosted tracing service.
 
 Configuration reads `TYPESAFE_API_KEY` and `JEV_MODEL` for TypeSafe and `OPENROUTER_API_KEY` for generation. The run manifest records only whether credentials are present, never their values. Model IDs, routing settings, prompts, token limits, request budgets, dataset revisions, and the $50 cap live in versioned config, with command-line overrides echoed to the manifest. A missing key blocks only its live adapter; offline fixtures, local retrievers, metrics, and replay remain testable.
 
 ## 12. Run layout and reproducibility
 
-One run directory per immutable manifest:
+Current run layout (the full run manifest is frozen at the later source audit gate):
 
 ```text
 runs/<run_id>/
-  manifest.yaml                 # config, git commit, dataset/model/index revisions
-  datasets.json                 # source checksums, license/terms review, split counts
-  queries.parquet               # query IDs, task/split, references/provenance pointers
-  pools/<retriever>.parquet     # saved ordered candidates
-  stages/<plugin>.parquet       # normalized inputs/outputs and metrics per stage
-  blobs/<hash>                  # exact text, prompts, raw API payloads (sanitized)
-  traces.parquet                # spans, attempts, retries, status, usage, timing
-  metrics.parquet               # per-query and aggregate scores with denominators
-  reports/                      # plots, failure analysis, cost/quality frontier
+  <dataset>/source_manifest.json # source checksums and counts
+  <dataset>/chunks.sqlite        # shared corpus and FTS5 index
+  <dataset>/queries.json         # query IDs, task and split
+  <dataset>/gold.json            # answer and evidence labels
+  <dataset>/dense.npy            # optional dense vectors, with FAISS sidecar
+  <dataset>/results/*.json       # per-query intermediate and final metrics
+  artifacts/blobs/*.json         # exact stage inputs and outputs
+  artifacts/stages/*.json        # stage records and cache keys
+  raw/<provider>/*.json          # sanitized requests, responses and attempts
+  budget.sqlite                  # shared spend and request ledger
+  rate_<provider>.sqlite         # shared rate gates
+  report.json                    # aggregate quality, latency, status and budget
+  parquet/*.parquet              # optional exported stage and attempt tables
 ```
 
 Capture operating system, Python/dependency lock, CUDA/MPS/CPU device, GPU type, index settings, random seeds, timezone/UTC timestamps, requested and resolved provider model, price table/date, and evaluator/judge revision. Produce a machine-readable comparison report and a human-readable methods/report appendix. Artifact hashes and schemas allow a reader to reproduce both an aggregate number and an individual answer path. Keep secrets and downloaded corpora out of Git.
 
 ## 13. Implementation sequence and exit gates
 
-This is the order for the **subsequent coding phase**. A milestone is done only when its gate passes; a smoke test on five queries is not the paper's result.
+This is the build and verification order. The code path through all eight milestones exists on `feature/production-rag`, including parallel query execution, a dry-run matrix command, replay, reports, service, and local fault injection. Development fixtures cover the adapters and main contracts. The source audits, real corpus joins, local model weight smoke tests, live provider preflight, and full experiment are still pending; fixture passes are not paper results. A milestone is complete only when its exit gate passes.
 
 | Milestone | Build | Exit gate / evidence |
 |---|---|---|
@@ -265,7 +269,7 @@ This is the order for the **subsequent coding phase**. A milestone is done only 
 | 3. Retrieval | BM25, dense, hybrid indices and frozen candidate pools | Candidate IDs/text deterministic; index smoke test and gold mapping audit pass; pool saved once and reused by every reranker. |
 | 4. Baseline rerankers | No rerank, MiniLM, BGE, Qwen, simple TypeSafe JEV | Every plugin returns complete score/rank/failure records from the same pool; JEV usage, resolved model, and actual request count reconcile with ledger. |
 | 5. RAG answer path | Fixed packer, OpenRouter generator adapter, task output parsers, citation mapping | `moonshotai/kimi-k2.5` and verified provider routing fixed across reranker arms; native answer formats parse and citations resolve. |
-| 6. Quality evaluation | Native metrics, IR measures, selected Ragas metrics, paired analysis, reports | Each metric's applicability and denominator explicit; reranking and answer results connect to traces; held-out settings frozen. |
+| 6. Quality evaluation | Native metrics, IR measures, optional fixed OpenRouter judge, paired analysis, reports | Each metric's applicability and denominator explicit; reranking and answer results connect to traces; held-out settings frozen. |
 | 7. Service/operations | FastAPI endpoint, shared rate limiter, fault policy, Locust profiles, cost dashboard | Stage/end-to-end p50/p95/p99, throughput, retries, 429/5xx, queue, usage, cost and fallback quality available; bounded ramp succeeds within cap. |
 | 8. Replay and extension checks | Recompute new ranking formulas, context policies, prompts, and metrics from saved boundaries | No upstream provider call is repeated when inputs/configuration are unchanged; changed inputs invalidate only the necessary downstream stages; live and replay costs stay separate. |
 
@@ -283,7 +287,7 @@ Build the new harness in `src/jev_eval/rag/` and expose it through `jev-eval rag
 | Retrieval | `rag/retrieval.py`, `rag/indexes.py`: BM25/FAISS adapters, RRF, frozen pools, index manifests and build validation. |
 | Reranking | `rag/reranking.py`, `rag/clients/typesafe.py`: no-rerank/local models/JEV, exact request/response capture, limiter and retry ledger. |
 | Answer path | `rag/context.py`, `rag/clients/openrouter.py`, `rag/generation.py`: token packing, fixed prompts, answer parsing, citations, provider metadata. |
-| Evaluation/reporting | `rag/evaluation.py`, `rag/metrics.py`, `rag/reporting.py`: native metric wrappers, IR/Ragas registry, paired comparisons, quality/cost/latency reports. |
+| Evaluation/reporting | `rag/evaluation.py`, `rag/judge.py`, `rag/reporting.py`: native metrics, optional fixed judge, paired comparisons, quality/cost/latency reports. |
 | Operations | `rag/service.py`, `rag/telemetry.py`, `rag/budget.py`, `rag/load/`: endpoint, spans, cost reservations, fake-provider and later real load profiles. |
 | User-facing entry | `configs/rag/` frozen configs; `jev-eval rag audit-sources`, `index`, `retrieve`, `rerank`, `generate`, `evaluate`, `replay`, `report`, `serve`, and `load` commands; `tests/rag/` fixtures and contract tests. |
 
@@ -357,4 +361,4 @@ The five datasets, initial retrieval arms, initial rerankers, standard JEV metho
 - [KILT task data](https://huggingface.co/datasets/facebook/kilt_tasks); [KILT repository](https://github.com/facebookresearch/KILT)
 - [TypeSafe API schema](https://api.typesafe.ai/openapi.json); [TypeSafe API docs](https://docs.typesafe.ai/api)
 - [OpenRouter Kimi K2.5 listing](https://openrouter.ai/moonshotai/kimi-k2.5); [Kimi K3 listing](https://openrouter.ai/moonshotai/kimi-k3); [provider routing](https://openrouter.ai/docs/guides/routing/provider-selection); [generation metadata](https://openrouter.ai/docs/api/api-reference/generations/get-generation)
-- [Ragas metric reference](https://docs.ragas.io/en/stable/concepts/metrics/available_metrics/); [LangChain documentation](https://docs.langchain.com/)
+- [OpenTelemetry Python documentation](https://opentelemetry.io/docs/languages/python/)

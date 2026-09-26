@@ -22,7 +22,7 @@ datasets:
 retrievers:
   - id: bm25
     kind: retriever
-    params: {backend: pyserini, k1: 1.2, b: 0.75}
+    params: {backend: sqlite_fts5}
   - id: qwen_dense
     kind: retriever
     params: {model: Qwen/Qwen3-Embedding-0.6B, backend: faiss}

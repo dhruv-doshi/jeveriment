@@ -1,4 +1,4 @@
-"""Single-process SQLite request ledger and shared, conservative spend accounting."""
+"""Cross-process SQLite request ledger and shared, conservative spend accounting."""
 
 import sqlite3
 import time
@@ -39,25 +39,20 @@ class Ledger:
         """)
         self.db.execute("BEGIN IMMEDIATE")
         try:
-            # Reconcile records written by an older client before this process
-            # starts. This scan runs once per connection, not once per request.
-            rows = self.db.execute(
-                "SELECT reserved_usd, actual_usd, reserved_tokens, tokens "
-                "FROM attempts"
-            ).fetchall()
-            known = sum(
-                (Decimal(a) for _, a, _, _ in rows if a is not None),
-                Decimal(0),
-            )
-            reserved = sum(
-                (Decimal(r) for r, a, _, _ in rows if a is None),
-                Decimal(0),
-            )
-            tokens = sum(t if t is not None else r for _, _, r, t in rows)
-            self.db.execute(
-                "INSERT OR REPLACE INTO budget_state VALUES(1,?,?,?,?,?)",
-                (len(rows), str(known + reserved), str(known), str(reserved), tokens),
-            )
+            if self.db.execute("SELECT COUNT(*) FROM budget_state").fetchone()[0] == 0:
+                # Migrate an older database once. New attempts and totals update
+                # atomically in the same transaction, so later clients avoid a scan.
+                rows = self.db.execute(
+                    "SELECT reserved_usd, actual_usd, reserved_tokens, tokens "
+                    "FROM attempts"
+                ).fetchall()
+                known = sum((Decimal(a) for _, a, _, _ in rows if a is not None), Decimal(0))
+                reserved = sum((Decimal(r) for r, a, _, _ in rows if a is None), Decimal(0))
+                tokens = sum(t if t is not None else r for _, _, r, t in rows)
+                self.db.execute(
+                    "INSERT INTO budget_state VALUES(1,?,?,?,?,?)",
+                    (len(rows), str(known + reserved), str(known), str(reserved), tokens),
+                )
             self.db.commit()
         except Exception:
             self.db.rollback()
@@ -68,6 +63,12 @@ class Ledger:
             "SELECT raw_path FROM success WHERE request_key=?", (key,)
         ).fetchone()
         return read_json(row[0])["response"] if row else None
+
+    def cached_path(self, key):
+        row = self.db.execute(
+            "SELECT raw_path FROM success WHERE request_key=?", (key,)
+        ).fetchone()
+        return row[0] if row else None
 
     def totals(self):
         attempts, cost, known, reserved, tokens = self.db.execute(
