@@ -16,6 +16,16 @@ class QueryRecord(StrictModel):
     split: str
     task: str
     corpus_scope: str | None = None
+    answer_options: dict[str, str] = Field(default_factory=dict)
+
+
+class GoldRecord(StrictModel):
+    dataset_id: str
+    query_id: str
+    answers: tuple[str, ...] = ()
+    qrels: dict[str, int] = Field(default_factory=dict)
+    evidence_sets: tuple[tuple[str, ...], ...] = ()
+    metric_availability: dict[str, str] = Field(default_factory=dict)
 
 
 class ChunkRecord(StrictModel):
@@ -25,6 +35,9 @@ class ChunkRecord(StrictModel):
     text: str
     text_hash: str
     source_offset: int | None = Field(default=None, ge=0)
+    title: str | None = None
+    source_uri: str | None = None
+    corpus_scope: str | None = None
 
     @model_validator(mode="after")
     def validate_hash(self):
@@ -83,3 +96,42 @@ class StageRecord(StrictModel):
     mode: Literal["live", "replay", "fixture"]
     elapsed_ms: float = Field(ge=0)
     error: str | None = None
+
+
+class RerankResult(StrictModel):
+    query_id: str
+    pool_hash: str
+    reranker_id: str
+    ordered_ids: tuple[str, ...]
+    scores: dict[str, float]
+    raw_response_hashes: dict[str, str] = Field(default_factory=dict)
+    missing_ids: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_ranking(self):
+        if len(set(self.ordered_ids)) != len(self.ordered_ids):
+            raise ValueError("Duplicate reranked IDs")
+        if set(self.scores) | set(self.missing_ids) != set(self.ordered_ids):
+            raise ValueError("Reranker IDs do not match pool")
+        return self
+
+
+class ContextSelection(StrictModel):
+    query_id: str
+    selected_ids: tuple[str, ...]
+    dropped_ids: tuple[str, ...]
+    text: str
+    estimated_tokens: int = Field(ge=0)
+    budget_tokens: int = Field(gt=0)
+
+
+class GenerationResult(StrictModel):
+    query_id: str
+    model_requested: str
+    model_resolved: str
+    answer: str
+    citations: tuple[str, ...] = ()
+    usage: dict[str, int] = Field(default_factory=dict)
+    provider_generation_id: str | None = None
+    provider_timing_ms: float | None = None
+    raw_response_hash: str
