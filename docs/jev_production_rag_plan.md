@@ -15,7 +15,7 @@ Build a reproducible RAG system that answers two questions:
 1. Given the same retrieved candidate pool, when does a simple JEV reranker improve evidence selection and final answers compared with established rerankers?
 2. At what quality, latency, throughput, failure rate, and cost does that result hold under realistic load?
 
-The initial deliverable is a solid evaluation system and a **simple** JEV baseline. Merely calling JEV and sorting its scores is not a novel research contribution. A new JEV method is a later, explicit research decision and must be compared against this baseline and the closest established methods. The article should make dataset-specific claims and state the tested workload; it should not call JEV universally “production ready.”
+The initial deliverable is a solid evaluation system with **standard pointwise JEV** as the JEV arm. A new JEV algorithm is not part of the committed scope. Calling JEV and sorting its scores is an integration and evaluation contribution, not an algorithmic novelty claim. The article should make dataset-specific claims and state the tested workload; it should not call JEV universally “production ready.” The recording system must allow later changes to scoring, selection, prompts, or evaluation to start from the nearest saved stage.
 
 This plan chooses defaults so implementation can begin without waiting for all plugin choices. The few choices requiring the owner's judgment are in §15. No benchmark run should be described as a clinical or legal validation.
 
@@ -53,7 +53,7 @@ All arrows write versioned input/output records and trace spans.
 | Retriever | Return ordered candidates with scores from a corpus/index | BM25, dense, hybrid RRF | Fixed within each reranker arm |
 | Reranker | Score/order the saved pool, preserving candidate IDs and failures | No rerank, MiniLM, BGE, Qwen, simple JEV | Variable |
 | Context selector | Deduplicate and pack ranked chunks into a fixed token budget | Deterministic rank-order packer | Yes initially |
-| Generator | Produce answer and citations from question + selected context | Hosted and local adapters; one model chosen for primary run | Yes |
+| Generator | Produce answer and citations from question + selected context | OpenRouter primary adapter with one fixed model; local adapter optional | Yes |
 | Evaluator | Compute applicable native IR/answer metrics and supplemental RAG metrics | Native scripts, `ir_measures`, Ragas | Yes |
 | Trace sink | Persist each stage's inputs, outputs, usage, attempts, timing, errors | Local structured artifacts, OpenTelemetry spans | Always on |
 
@@ -75,6 +75,22 @@ Use versioned Pydantic schemas and content-addressed artifact references. Each r
 | `AttemptRecord` / `SpanRecord` | Per-attempt request/response artifacts, status, retry cause, queue wait, client timings, provider timing if available, token usage, price calculation, cache/fallback status. |
 
 The trace sink stores full public-benchmark input/output payloads for audit, including raw provider JSON and rendered prompts, alongside a compact Parquet event table and run manifest. Keep large text in immutable compressed blobs rather than repeating it in every row. Never store API keys or authorization headers. For future private corpora, permit payload redaction or encryption while retaining hashes and provenance; label such runs as less reproducible. Resume by stable `(run, stage, query, configuration)` IDs without duplicating billing calls. Validate joins, ranks, and artifact hashes in a trace-integrity report.
+
+### Replay from saved stages
+
+Treat the pipeline as a dependency graph of immutable artifacts. Each plugin execution records its configuration hash, exact upstream artifact hashes, implementation revision, output hash, and whether it was computed live or replayed. A changed plugin invalidates only its output and downstream stages. The runner finds the latest compatible saved boundary and starts there; it never silently mixes artifacts from different corpus, model, prompt, or rubric versions.
+
+| Later experiment | Reuse without another run | Work that must run again |
+|---|---|---|
+| New metric or judge rule | Saved labels, rankings, contexts, answers, citations and traces | Metric computation; a new LLM judge still requires judge API calls. |
+| New ordering/formula over **saved JEV scores** | Retrieval pools, exact JEV request/response payloads, per-candidate probabilities and usage | Reorder, context selection, generation, answer evaluation if selected evidence changes. |
+| New context-packing block | Saved retrieval and reranker outputs | Context packing, generation, final-answer evaluation. |
+| New generator prompt/model | Saved retrieval, reranking, and selected context | Generation and answer evaluation. |
+| New reranker with a different model/rubric | Saved candidate pools and chunk text | New reranker scoring and its downstream stages; new TypeSafe requests may incur cost. |
+| New retriever | Saved corpus/chunks and benchmark labels | Retrieval, reranking for newly encountered query–chunk pairs, and downstream stages. |
+| New chunking/corpus snapshot | Raw source downloads and query/label manifest if still compatible | Indexing, retrieval, reranking, and downstream stages. |
+
+Capture **every candidate's** raw JEV answer and request input, including candidates outside final top-k, so future score transforms can use the complete saved pool. Replaying a different formula over these scores needs no JEV calls. A genuinely new JEV question/rubric, a larger candidate pool, or a different model has no corresponding saved answers and therefore needs fresh calls. A different context selection or generator cannot reuse the old final answer if its input changed. Replay latency/cost is a separate measurement from live service latency/cost; report it as such.
 
 ## 4. Five selected datasets
 
@@ -118,11 +134,16 @@ Common reranker limits: same max candidate count, same displayed chunk text, doc
 
 The primary output is a complete reordered candidate list. The first context selector is deterministic: top-ranked unique evidence chunks packed until the same generator token budget is reached, preserving source citations. Compare rank top-k **and** actual selected context, because token lengths may cause different numbers of chunks to fit.
 
-Optional controls after the first complete run: MMR/evidence diversity, a larger cross-encoder if hardware allows, and a contextual or batched JEV variant. These are named experiments with separate configs. The novel method is not assumed to be any of them.
+Optional controls after the first complete run: MMR/evidence diversity, a larger cross-encoder if hardware allows, and a contextual or batched JEV variant. These are separately named experiments. They can consume compatible saved artifacts without changing the standard JEV baseline.
 
 ## 7. Generation and final answers
 
-- Define a generator protocol with local Hugging Face and hosted API adapters. Pick one pinned model for the primary factorial comparison before quality runs; the owner may later choose it without requiring architecture changes.
+The **generator** is the language model that reads the question and the evidence selected after reranking, then writes the final answer. It is distinct from the retriever (finds candidates) and reranker (orders candidates). “Primary generator” means the **one fixed generator model** used across all reranker arms in the main answer-quality comparison. Keeping it fixed lets an answer difference be attributed to the changed evidence.
+
+- **Primary provider and model:** OpenRouter with `openai/gpt-6-luna` for the main comparison. Its [OpenRouter listing](https://openrouter.ai/openai/gpt-6-luna/) currently shows $0.10/M input tokens and $0.50/M output tokens; recheck price and account access before bulk runs. This is a budget-conscious controlled generator, not a claim that it is the best medical or legal model. Kimi K3 is available, but its [current listed rates](https://openrouter.ai/moonshotai/kimi-k3) are materially higher, so it is not the default under the $50 cap.
+- Pin one verified OpenRouter provider endpoint with `provider.only`, `allow_fallbacks: false`, and `require_parameters: true` for the controlled answer-quality run. Do not use `openrouter/auto` or a cross-model fallback list in that run. Persist requested and returned model, actual provider, routing request, model parameters, generation ID, usage, and cost. Provider failover is a separate operational experiment and must not silently change the quality comparison. [Provider routing documentation](https://openrouter.ai/docs/guides/routing/provider-selection)
+- Define a generator protocol with this OpenRouter adapter first and a local Hugging Face adapter as an optional later plugin. Use an initial 4,096-token evidence budget and 768-token maximum answer, then freeze task-specific budgets on validation data before held-out comparisons; every reranker arm in a task uses identical budgets. Any model or budget change creates a new comparison run that reuses compatible earlier stage artifacts.
+- Start with **one** generator model to preserve budget and a clean reranker comparison. If a second model is useful for robustness, use a matched, prespecified subset and replay saved retrieval/reranking/context artifacts; only generation and final-answer evaluation need to run again. Do not mix generators in the same primary result table without labeling the generator factor.
 - One prompt template per task family, frozen across reranker arms. Cite evidence with stable document/chunk IDs. Medical answer options may be given to the **generator** according to MIRAGE rules but never to its retriever.
 - Use deterministic decoding where supported (`temperature=0`, explicit seed if supported), max output tokens, and a fixed context budget. Record resolved model version and any nondeterminism.
 - Preserve native answer format: MIRAGE option, HotpotQA short answer plus supporting facts, QASPER answer/abstention, FEVER label plus evidence, CLERC answer with citations. Reject malformed output into a counted format-failure category.
@@ -152,7 +173,7 @@ Statistical analysis: paired per-query deltas within each fixed candidate pool, 
 
 Use monotonic client clocks and OpenTelemetry spans. Capture `queue_wait`, `retrieve`, `rerank`, `pack`, `generate`, `evaluate`, and end-to-end durations. For each provider attempt, capture dispatch-to-response wall time, time to first byte where the client stack exposes it, body download/read time, retry backoff, and response parsing; keep connection setup measurements only when the HTTP transport can reliably expose them. Record warm versus cold start and cache status. Use p50/p95/p99 with sample count and confidence/uncertainty where useful; never compute p99 from a tiny sample without flagging it.
 
-**API latency is measurable; server-side model inference time is not necessarily exposed.** TypeSafe's documented `/v1/systemone` response contains resolved `model`, `answers`, and token `usage`, but no inference-time field. The adapter checks for a documented response header such as `Server-Timing` during preflight and records a provider timing only if supplied with clear semantics. Otherwise store `provider_inference_ms = null` and `provider_timing_source = not_exposed`. Never subtract client network time from API duration and call the remainder model inference. Local-model inference time is measured around forward passes, with device synchronization for GPU timing. Generator time to first token is collected only for streaming APIs.
+**API latency is measurable; server-side model inference time is not necessarily exposed.** TypeSafe's documented `/v1/systemone` response contains resolved `model`, `answers`, and token `usage`, but no inference-time field. The adapter checks for a documented response header such as `Server-Timing` during preflight and records a provider timing only if supplied with clear semantics. Otherwise store `provider_inference_ms = null` and `provider_timing_source = not_exposed`. Never subtract client network time from API duration and call the remainder model inference. Local-model inference time is measured around forward passes, with device synchronization for GPU timing. Generator time to first token is collected only for streaming APIs. OpenRouter's [generation metadata endpoint](https://openrouter.ai/docs/api/api-reference/generations/get-generation) exposes fields such as `latency`, `generation_time`, provider name, usage, and total cost; store these with OpenRouter provenance and verify units/semantics before labeling `generation_time` as model inference. They are additional to client-observed end-to-end API latency.
 
 ### Operational metrics
 
@@ -163,7 +184,9 @@ Use monotonic client clocks and OpenTelemetry spans. Capture `queue_wait`, `retr
 - Cost: provider billed tokens and USD per query/1,000 queries, retrieval/rerank/generation/judge components, local GPU-hours/energy proxy, storage/index cost. Store currency and price-table revision; distinguish actual invoices from estimates and zero-priced promotional requests from underlying token use.
 - Stratification: query/context length bins, candidate depth, document length/truncation, task/dataset, concurrency, cache state, success/failure. Plot quality and latency against input tokens and candidate count.
 
-The cost ledger reserves an estimate **before** dispatch and reconciles actual usage after response. It enforces request, token, and USD caps, with hard stops and a traceable override. Forecast calls as `sum(query × retriever arm × unique candidate pairs)` for pointwise JEV, adjusted for reusable identical query–chunk–rubric scores and retry rates. For example, 1,000 queries × 3 retrieval arms × 100 candidates can approach 300,000 pair scores before deduplication. Compute the forecast from the selected splits before any bulk run. Caching may share a score only when query, chunk text/hash, rubric, model revision, truncation, and JEV mode match exactly; contextual scores are not interchangeable with independent scores.
+The **$50 USD ceiling** is a hard global cap on incremental experiment spend across TypeSafe JEV, paid generator/judge APIs, and paid cloud compute/storage used for these runs. Free requests still count toward request/token/rate budgets and are logged at their actual $0 charge. The cost ledger reserves an estimate **before** dispatch and reconciles actual usage after response. It enforces request, token, and USD caps, with a hard stop at $50 and a traceable change only after the owner explicitly changes the budget. Because cloud invoices can lag, reserve projected instance hours/storage before starting paid infrastructure and stop when the remaining headroom cannot cover the next planned block. Do not start a bulk run whose forecast exceeds the remaining cap; scale down the matched sample or split the work into budgeted blocks and report coverage.
+
+Forecast calls as `sum(query × retriever arm × unique candidate pairs)` for pointwise JEV, adjusted for reusable identical query–chunk–rubric scores and retry rates. For example, 1,000 queries × 3 retrieval arms × 100 candidates can approach 300,000 pair scores before deduplication. Compute the forecast from the selected splits before any bulk run. Caching may share a score only when query, chunk text/hash, rubric, model revision, truncation, and JEV mode match exactly; contextual scores are not interchangeable with independent scores.
 
 ## 10. Rate limits and load methodology
 
@@ -182,6 +205,7 @@ Load phases, after offline quality passes: single-user baseline; controlled conc
 | Reranking | `sentence-transformers`/Transformers for local cross-encoders; direct `httpx` for TypeSafe JEV so response/attempt details remain observable. |
 | Metrics | Official benchmark scripts + `ir_measures`; Ragas for supplemental RAG metrics. |
 | Trace/analysis | OpenTelemetry spans; immutable JSON blobs + Parquet tables; DuckDB for queryable reports and plots. Optional LangSmith export if desired, never required for the canonical record. |
+| Primary generation | Direct OpenRouter chat completion adapter using `httpx`, with `usage` requested, generation metadata reconciliation, fixed model/provider routing, and local artifact recording. |
 | Service/load | FastAPI for an answer endpoint; Locust for repeatable ramp and burst profiles; standard host/GPU telemetry. |
 
 Exact dependency versions and container image digest are pinned when implementation starts. `LangChain`, `Ragas`, and `LangSmith` are not used as interchangeable “evaluation frameworks”: LangChain composes calls, Ragas computes optional answer metrics, and LangSmith is optional hosted trace inspection. The canonical artifact store is local/exportable, so experiments do not depend on a paid tracing service.
@@ -216,22 +240,14 @@ This is the order for the **subsequent coding phase**. A milestone is done only 
 | 2. Dataset adapters | MIRAGE, CLERC, HotpotQA fullwiki, QASPER, KILT-FEVER | Counts and sampled IDs match source; corpus and reference/evidence mapping checked; no train/test leakage; official eval subset passes known examples. |
 | 3. Retrieval | BM25, dense, hybrid indices and frozen candidate pools | Candidate IDs/text deterministic; index smoke test and gold mapping audit pass; pool saved once and reused by every reranker. |
 | 4. Baseline rerankers | No rerank, MiniLM, BGE, Qwen, simple TypeSafe JEV | Every plugin returns complete score/rank/failure records from the same pool; JEV usage, resolved model, and actual request count reconcile with ledger. |
-| 5. RAG answer path | Fixed packer, generator adapters, task output parsers, citation mapping | Same generator prompt settings/context budget across reranker arms; native answer formats parse and citations resolve. |
+| 5. RAG answer path | Fixed packer, OpenRouter generator adapter, task output parsers, citation mapping | `openai/gpt-6-luna` and verified provider routing fixed across reranker arms; native answer formats parse and citations resolve. |
 | 6. Quality evaluation | Native metrics, IR measures, selected Ragas metrics, paired analysis, reports | Each metric's applicability and denominator explicit; reranking and answer results connect to traces; held-out settings frozen. |
 | 7. Service/operations | FastAPI endpoint, shared rate limiter, fault policy, Locust profiles, cost dashboard | Stage/end-to-end p50/p95/p99, throughput, retries, 429/5xx, queue, usage, cost and fallback quality available; bounded ramp succeeds within cap. |
-| 8. Research extension | Novel algorithm only after hypothesis/prior-art review | It beats or clarifies the simple JEV and closest evidence-selection baselines on held-out data, with ablations and cost/latency trade-offs. |
+| 8. Replay and extension checks | Recompute new ranking formulas, context policies, prompts, and metrics from saved boundaries | No upstream provider call is repeated when inputs/configuration are unchanged; changed inputs invalidate only the necessary downstream stages; live and replay costs stay separate. |
 
 Recommended execution scale: tiny fixture → one validation slice per dataset → all validation queries for baseline ranking metrics → matched answer-generation subset → held-out full answer run if affordable → operational workload. Sample queries deterministically and stratify by length/task/answerability, then report the sample definition. Keep all five datasets in the final suite even if early development starts with one. Scale production load independently from article-quality testing.
 
-### Novelty design gate
-
-Once the baseline traces show where JEV wins and fails, review primary work on pointwise/listwise reranking, budgeted context selection, uncertainty-aware ranking, diversity/MMR, and cascade reranking. Candidate hypotheses to discuss, **not decisions**:
-
-- Use typed JEV probabilities to allocate a limited scoring budget to uncertain candidates, then hand off to a cheaper/faster scorer for the rest.
-- Select a nonredundant evidence set under a fixed generator-token budget using JEV's relevance estimate plus measured marginal coverage.
-- Route queries between JEV and local rerankers based on predicted value of additional computation.
-
-For any selected method, write pseudocode, objective, computational/request complexity, required supervision, and falsifiable expected gain **before** held-out evaluation. Compare with the simple JEV sort, no rerank, best cross-encoder, fixed top-k, and the closest established selection or cascade method. Ablate each new component and report whether quality gains survive matched dollar, token, and p95 latency budgets. A method is not called novel merely because its combination has a new name.
+Future algorithms can be evaluated from the stored stage boundaries when their required inputs already exist. A future method that asks JEV new questions or scores documents outside the saved pool will require those specific new calls. No novelty claim is planned for the standard JEV baseline.
 
 ## 14. Failure modes and controls
 
@@ -251,11 +267,9 @@ These do **not** block building the dataset adapters, retrieval/reranker plugins
 
 | Decision for owner | Needed before | Default path until decided |
 |---|---|---|
-| Primary generator provider/model and maximum context/output budget | Milestone 5's matched final-answer experiment | Build hosted/local adapters and use a replaceable development model for fixtures; no publishable primary answer scores until fixed. |
-| Spend ceiling and intended service workload: concurrency, query mix, p95/p99, availability and acceptable fallback | Bulk API calls and milestone 7 production-readiness claim | Use small capped smoke runs and publish measured curves without a pass/fail “production ready” label. |
-| Novel JEV-based algorithm/hypothesis and minimum meaningful gain | Milestone 8 and article novelty claim | Keep simple JEV as a baseline; perform a prior-art review before proposing a method. |
+| Intended service workload: concurrency, query mix, p95/p99, availability and acceptable fallback | Milestone 7 production-readiness claim | Use the $50 global cap, small bounded runs, and publish measured curves without a pass/fail “production ready” label. |
 
-The five datasets, initial retrieval arms, initial rerankers, trace design, metric applicability, tooling, and build order are selected in this plan. If a source audit reveals that a dataset's corpus/terms cannot support the intended run, replace it only with a documented reason and a benchmark with equivalent task coverage; do not quietly modify the suite after seeing results.
+The five datasets, initial retrieval arms, initial rerankers, standard JEV method, OpenRouter primary generator, $50 spend cap, trace/replay design, metric applicability, tooling, and build order are selected in this plan. If a source audit reveals that a dataset's corpus/terms cannot support the intended run, replace it only with a documented reason and a benchmark with equivalent task coverage; do not quietly modify the suite after seeing results.
 
 ## Sources and protocols
 
@@ -265,4 +279,5 @@ The five datasets, initial retrieval arms, initial rerankers, trace design, metr
 - [QASPER dataset card](https://huggingface.co/datasets/allenai/qasper)
 - [KILT task data](https://huggingface.co/datasets/facebook/kilt_tasks); [KILT repository](https://github.com/facebookresearch/KILT)
 - [TypeSafe API schema](https://api.typesafe.ai/openapi.json); [TypeSafe API docs](https://docs.typesafe.ai/api)
+- [OpenRouter GPT-6 Luna listing](https://openrouter.ai/openai/gpt-6-luna/); [Kimi K3 listing](https://openrouter.ai/moonshotai/kimi-k3); [provider routing](https://openrouter.ai/docs/guides/routing/provider-selection); [generation metadata](https://openrouter.ai/docs/api/api-reference/generations/get-generation)
 - [Ragas metric reference](https://docs.ragas.io/en/stable/concepts/metrics/available_metrics/); [LangChain documentation](https://docs.langchain.com/)
