@@ -289,6 +289,22 @@ Keep the existing fixed-pool `jev_eval` pilot commands and run artifacts readabl
 
 The command-line runner defaults to `--dry-run` for any command that could call a paid provider or create large indexes. A live command needs a frozen manifest plus an explicit run mode and budget forecast; `rag load` against real providers remains disabled until the owner-triggered experiment. Each command prints the stage boundary it will reuse, the exact number of pending calls, estimated worst-case spend, and artifact destination before dispatch.
 
+### Disposition of the existing codebase
+
+The present code remains the reproducible BEIR/fixed-pool pilot. Existing `01_setup.sh` through `07_decisions.sh`, `jev-eval prepare/retrieve/rerank/evaluate`, configs, and `runs/` artifacts keep their current behavior. The new RAG commands use separate configs and run IDs so a new experiment cannot overwrite a pilot artifact. The existing test suite stays a regression gate. Specific reuse/refactor choices:
+
+| Existing area | Treatment in the new work |
+|---|---|
+| `contracts.py`, `io.py` | Reuse canonical hashing and strict validation patterns. Introduce general `rag` records because the current `Candidate` and `Pool` require BM25/dense fields and do not represent arbitrary retrieval plugins or stage outputs. |
+| `data.py`, `pipeline.prepare()` | Preserve BEIR ingestion. Add five dataset adapters and dataset-aware chunk/provenance mapping in `rag/datasets/`; no attempt to coerce medical, legal, and multi-hop data into BEIR JSONL. |
+| `retrieve.py`, `pipeline.retrieve()` | Reuse ranking/RRF semantics and small-corpus test cases. The current pipeline computes corpus-wide score dictionaries and refuses corpora over 100,000 documents; large-corpus retrieval needs persistent BM25/FAISS indices and saved top-k pools. |
+| `models.py`, `jev.py`, `ledger.py` | Reuse local model-loading, JEV schema validation, raw request capture, retry/backoff, and reservation ideas after interface tests. Isolate provider adapters behind the new plugin contract. Replace the Jev-only budget view with one global $50 ledger covering JEV, OpenRouter, judges, and paid infrastructure. |
+| `metrics.py`, `stats.py`, `reporting.py` | Reuse validated IR and paired-statistics functions when their judgment assumptions fit; wrap them in dataset-aware metric availability/denominator rules. Add native answer and evidence metrics without changing historical pilot results. |
+| `generation.py` | Keep the local-generator pilot extension readable. The main answer path adds OpenRouter generation, task-specific output parsing, complete prompt/response records, and selective replay. |
+| `cli.py` and shell scripts | Add a namespaced `rag` command group; retain old commands and scripts rather than changing their defaults or CLI meaning. |
+
+Extract a shared helper only when its behavior can be stated independently of the old pilot and the old tests still pass. A migration note will identify any deliberate artifact/schema changes; old run directories are read-only inputs, never silently rewritten.
+
 Future algorithms can be evaluated from the stored stage boundaries when their required inputs already exist. A future method that asks JEV new questions or scores documents outside the saved pool will require those specific new calls. No novelty claim is planned for the standard JEV baseline.
 
 ### Development verification and permission boundary
