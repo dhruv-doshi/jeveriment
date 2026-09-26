@@ -1,14 +1,14 @@
 # JEV in production-style RAG: implementation plan
 
-**Status:** complete implementation plan; code and experiment pending
+**Status:** complete implementation plan; clean branch foundation in progress
 
 **Updated:** 2026-09-26
 
-**Branch:** `plan/production-rag`
+**Branch:** `feature/production-rag` (the original plan remains on `plan/production-rag`)
 
 **Scope:** five existing benchmarks, pluggable retrieval and reranking, fixed primary generation comparisons, quality and operational evaluation
 
-**Execution state:** plan only. Development may begin after the owner asks to proceed; the complete five-dataset evaluation and live-provider load test require a later explicit instruction from the owner. No implementation or experiment has begun in this branch.
+**Execution state:** branch cleanup and the configuration/artifact foundation are underway. Development tests are authorized. The complete five-dataset evaluation and live-provider load test require a later explicit instruction from the owner; neither has begun.
 
 ## 1. Purpose and claim boundary
 
@@ -158,7 +158,7 @@ Optional controls after the first complete run: MMR/evidence diversity, a larger
 
 The **generator** is the language model that reads the question and the evidence selected after reranking, then writes the final answer. It is distinct from the retriever (finds candidates) and reranker (orders candidates). “Primary generator” means the **one fixed generator model** used across all reranker arms in the main answer-quality comparison. Keeping it fixed lets an answer difference be attributed to the changed evidence.
 
-- **Primary provider and model:** OpenRouter with `openai/gpt-6-luna` for the main comparison. Its [OpenRouter listing](https://openrouter.ai/openai/gpt-6-luna/) currently shows $0.10/M input tokens and $0.50/M output tokens; recheck price and account access before bulk runs. This is a budget-conscious controlled generator, not a claim that it is the best medical or legal model. Kimi K3 is available, but its [current listed rates](https://openrouter.ai/moonshotai/kimi-k3) are materially higher, so it is not the default under the $50 cap.
+- **Primary provider and model:** OpenRouter with [`moonshotai/kimi-k2.5`](https://openrouter.ai/moonshotai/kimi-k2.5) for the main comparison. The listed rates on 2026-09-26 are $0.45/M input tokens and $2.25/M output tokens; recheck price, provider route, and account access before bulk runs. This is a budget-conscious controlled generator, not a claim that it is the best medical or legal model. [Kimi K3](https://openrouter.ai/moonshotai/kimi-k3) is available at materially higher listed rates, so it is not the default under the $50 cap.
 - Pin one verified OpenRouter provider endpoint with `provider.only`, `allow_fallbacks: false`, and `require_parameters: true` for the controlled answer-quality run. Do not use `openrouter/auto` or a cross-model fallback list in that run. Persist requested and returned model, actual provider, routing request, model parameters, generation ID, usage, and cost. Provider failover is a separate operational experiment and must not silently change the quality comparison. [Provider routing documentation](https://openrouter.ai/docs/guides/routing/provider-selection)
 - Define a generator protocol with this OpenRouter adapter first and a local Hugging Face adapter as an optional later plugin. Use an initial 4,096-token evidence budget and 768-token maximum answer, then freeze task-specific budgets on validation data before held-out comparisons; every reranker arm in a task uses identical budgets. Any model or budget change creates a new comparison run that reuses compatible earlier stage artifacts.
 - Start with **one** generator model to preserve budget and a clean reranker comparison. If a second model is useful for robustness, use a matched, prespecified subset and replay saved retrieval/reranking/context artifacts; only generation and final-answer evaluation need to run again. Do not mix generators in the same primary result table without labeling the generator factor.
@@ -264,7 +264,7 @@ This is the order for the **subsequent coding phase**. A milestone is done only 
 | 2. Dataset adapters | MIRAGE, CLERC, HotpotQA fullwiki, QASPER, KILT-FEVER | Counts and sampled IDs match source; corpus and reference/evidence mapping checked; no train/test leakage; official eval subset passes known examples. |
 | 3. Retrieval | BM25, dense, hybrid indices and frozen candidate pools | Candidate IDs/text deterministic; index smoke test and gold mapping audit pass; pool saved once and reused by every reranker. |
 | 4. Baseline rerankers | No rerank, MiniLM, BGE, Qwen, simple TypeSafe JEV | Every plugin returns complete score/rank/failure records from the same pool; JEV usage, resolved model, and actual request count reconcile with ledger. |
-| 5. RAG answer path | Fixed packer, OpenRouter generator adapter, task output parsers, citation mapping | `openai/gpt-6-luna` and verified provider routing fixed across reranker arms; native answer formats parse and citations resolve. |
+| 5. RAG answer path | Fixed packer, OpenRouter generator adapter, task output parsers, citation mapping | `moonshotai/kimi-k2.5` and verified provider routing fixed across reranker arms; native answer formats parse and citations resolve. |
 | 6. Quality evaluation | Native metrics, IR measures, selected Ragas metrics, paired analysis, reports | Each metric's applicability and denominator explicit; reranking and answer results connect to traces; held-out settings frozen. |
 | 7. Service/operations | FastAPI endpoint, shared rate limiter, fault policy, Locust profiles, cost dashboard | Stage/end-to-end p50/p95/p99, throughput, retries, 429/5xx, queue, usage, cost and fallback quality available; bounded ramp succeeds within cap. |
 | 8. Replay and extension checks | Recompute new ranking formulas, context policies, prompts, and metrics from saved boundaries | No upstream provider call is repeated when inputs/configuration are unchanged; changed inputs invalidate only the necessary downstream stages; live and replay costs stay separate. |
@@ -273,7 +273,7 @@ Recommended execution scale: tiny fixture → one validation slice per dataset �
 
 ### Repository implementation map
 
-Keep the existing fixed-pool `jev_eval` pilot commands and run artifacts readable. Build the new harness in a separate `src/jev_eval/rag/` package and expose it through new `jev-eval rag ...` subcommands; shared existing functions may be extracted only when their current tests remain green. Proposed ownership:
+Build the new harness in `src/jev_eval/rag/` and expose it through `jev-eval rag ...` commands. Keep only generally reusable core functions from the fixed-pool pilot on this branch. The complete pilot remains readable on the earlier Git branch. Proposed ownership:
 
 | Area | Planned files and responsibilities |
 |---|---|
@@ -291,19 +291,19 @@ The command-line runner defaults to `--dry-run` for any command that could call 
 
 ### Disposition of the existing codebase
 
-The present code remains the reproducible BEIR/fixed-pool pilot. Existing `01_setup.sh` through `07_decisions.sh`, `jev-eval prepare/retrieve/rerank/evaluate`, configs, and `runs/` artifacts keep their current behavior. The new RAG commands use separate configs and run IDs so a new experiment cannot overwrite a pilot artifact. The existing test suite stays a regression gate. Specific reuse/refactor choices:
+On `feature/production-rag`, remove the BEIR/SciFact pilot scripts, configs, task-specific pipeline, and corresponding tests. They remain available on `feature/parallel-jev` and in Git history; existing run directories in other worktrees are untouched. Keep or port only behavior useful to the new experiment. Specific reuse/refactor choices:
 
 | Existing area | Treatment in the new work |
 |---|---|
-| `contracts.py`, `io.py` | Reuse canonical hashing and strict validation patterns. Introduce general `rag` records because the current `Candidate` and `Pool` require BM25/dense fields and do not represent arbitrary retrieval plugins or stage outputs. |
-| `data.py`, `pipeline.prepare()` | Preserve BEIR ingestion. Add five dataset adapters and dataset-aware chunk/provenance mapping in `rag/datasets/`; no attempt to coerce medical, legal, and multi-hop data into BEIR JSONL. |
-| `retrieve.py`, `pipeline.retrieve()` | Reuse ranking/RRF semantics and small-corpus test cases. The current pipeline computes corpus-wide score dictionaries and refuses corpora over 100,000 documents; large-corpus retrieval needs persistent BM25/FAISS indices and saved top-k pools. |
-| `models.py`, `jev.py`, `ledger.py` | Reuse local model-loading, JEV schema validation, raw request capture, retry/backoff, and reservation ideas after interface tests. Isolate provider adapters behind the new plugin contract. Replace the Jev-only budget view with one global $50 ledger covering JEV, OpenRouter, judges, and paid infrastructure. |
-| `metrics.py`, `stats.py`, `reporting.py` | Reuse validated IR and paired-statistics functions when their judgment assumptions fit; wrap them in dataset-aware metric availability/denominator rules. Add native answer and evidence metrics without changing historical pilot results. |
-| `generation.py` | Keep the local-generator pilot extension readable. The main answer path adds OpenRouter generation, task-specific output parsing, complete prompt/response records, and selective replay. |
-| `cli.py` and shell scripts | Add a namespaced `rag` command group; retain old commands and scripts rather than changing their defaults or CLI meaning. |
+| `io.py` | Keep canonical hashing and atomic JSON I/O. General `rag` records replace fixed BM25/dense `Candidate` and `Pool` records. |
+| `data.py`, `pipeline.prepare()` | Remove the BEIR ingestion path. Add five dataset adapters and dataset-aware chunk/provenance mapping in `rag/datasets/`. |
+| `retrieve.py`, `pipeline.retrieve()` | Port ranking/RRF semantics where useful. Replace corpus-wide score dictionaries and the 100,000-document ceiling with persistent BM25/FAISS indices and saved top-k pools. |
+| `models.py`, `jev.py`, `ledger.py` | Port local model and JEV schema/retry behavior into provider plugins. Keep the generic SQLite reservation ledger as a starting point and extend it to one global $50 cap across JEV, OpenRouter, judges, and paid infrastructure. |
+| `metrics.py`, `stats.py` | Keep reusable ranking metrics and paired statistics; wrap them in dataset-aware availability/denominator rules and add native answer/evidence metrics. |
+| `generation.py` | Remove the pilot local generator. Build an OpenRouter answer path with task-specific parsing, complete request/response records, and selective replay. |
+| `cli.py` and shell scripts | Replace pilot commands with a namespaced `rag` command group; remove old shell scripts. |
 
-Extract a shared helper only when its behavior can be stated independently of the old pilot and the old tests still pass. A migration note will identify any deliberate artifact/schema changes; old run directories are read-only inputs, never silently rewritten.
+Extract a shared helper only when its behavior can be stated independently of the old pilot. A migration note will identify deliberate artifact/schema changes; old run directories in other worktrees are never silently rewritten.
 
 Future algorithms can be evaluated from the stored stage boundaries when their required inputs already exist. A future method that asks JEV new questions or scores documents outside the saved pool will require those specific new calls. No novelty claim is planned for the standard JEV baseline.
 
@@ -322,7 +322,7 @@ The owner's instruction is to run all required **development tests** and wait fo
 | Replay and tracing | Recompute ranking formula, context selection, generator, evaluator independently from saved boundaries | Identical config makes zero new external calls; a changed config invalidates only downstream artifacts; live versus replay timing/cost remains distinct. |
 | Service/load harness | Locust against a local fake provider with controlled delay/429/5xx and telemetry | p50/p95/p99, queue, retries, throughput, fallback, and cost attribution match injected conditions without real provider load. |
 
-Run the repository's existing test suite and lint on each implementation milestone, plus the targeted contract tests above. Record test commands, pass/fail counts, skipped optional-model checks, and fixture revisions in a development report. A single live TypeSafe and OpenRouter preflight can verify authentication, response schema, exact model/provider, token usage, and price/latency metadata when keys are available; avoid using a real benchmark question for this check if dataset terms have not cleared hosted inference. An absent key or unverified dataset license is a named untested integration, never a claimed pass.
+Run the new branch's test suite and lint on each implementation milestone, plus the targeted contract tests above. The pilot-specific test suite remains on the earlier branch. Record test commands, pass/fail counts, skipped optional-model checks, and fixture revisions in a development report. A single live TypeSafe and OpenRouter preflight can verify authentication, response schema, exact model/provider, token usage, and price/latency metadata when keys are available; avoid using a real benchmark question for this check if dataset terms have not cleared hosted inference. An absent key or unverified dataset license is a named untested integration, never a claimed pass.
 
 Before the owner-triggered full experiment, publish a **run-ready packet**: clean code commit and lockfile, five adapter source audits, frozen split/query manifests, model/rubric/prompt/index revisions, all development test results, account-specific price/rate limits, forecast with contingency below $50, planned query counts, and the exact commands that would run. Stop there and wait for the owner's instruction. The later full run begins only from that frozen packet; unexpected model drift, cost overrun, or source mismatch stops it and produces an incident record rather than silently changing the protocol.
 
@@ -356,5 +356,5 @@ The five datasets, initial retrieval arms, initial rerankers, standard JEV metho
 - [QASPER dataset card](https://huggingface.co/datasets/allenai/qasper)
 - [KILT task data](https://huggingface.co/datasets/facebook/kilt_tasks); [KILT repository](https://github.com/facebookresearch/KILT)
 - [TypeSafe API schema](https://api.typesafe.ai/openapi.json); [TypeSafe API docs](https://docs.typesafe.ai/api)
-- [OpenRouter GPT-6 Luna listing](https://openrouter.ai/openai/gpt-6-luna/); [Kimi K3 listing](https://openrouter.ai/moonshotai/kimi-k3); [provider routing](https://openrouter.ai/docs/guides/routing/provider-selection); [generation metadata](https://openrouter.ai/docs/api/api-reference/generations/get-generation)
+- [OpenRouter Kimi K2.5 listing](https://openrouter.ai/moonshotai/kimi-k2.5); [Kimi K3 listing](https://openrouter.ai/moonshotai/kimi-k3); [provider routing](https://openrouter.ai/docs/guides/routing/provider-selection); [generation metadata](https://openrouter.ai/docs/api/api-reference/generations/get-generation)
 - [Ragas metric reference](https://docs.ragas.io/en/stable/concepts/metrics/available_metrics/); [LangChain documentation](https://docs.langchain.com/)

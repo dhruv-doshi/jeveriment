@@ -1,0 +1,52 @@
+experiment_id: production_rag_v1
+seed: 1729
+budget_usd: "50"
+candidate_depth: 100
+max_saved_depth: 200
+datasets:
+  - id: mirage
+    source: https://github.com/gzxiong/MIRAGE
+    task: medical_multiple_choice
+  - id: clerc
+    source: https://huggingface.co/datasets/jhu-clsp/CLERC
+    task: legal_retrieval_generation
+  - id: hotpotqa
+    source: https://hotpotqa.github.io/
+    task: multi_hop_question_answering
+  - id: qasper
+    source: https://huggingface.co/datasets/allenai/qasper
+    task: scientific_paper_question_answering
+  - id: kilt_fever
+    source: https://huggingface.co/datasets/facebook/kilt_tasks
+    task: fact_verification
+retrievers:
+  - id: bm25
+    kind: retriever
+    params: {backend: pyserini, k1: 1.2, b: 0.75}
+  - id: qwen_dense
+    kind: retriever
+    params: {model: Qwen/Qwen3-Embedding-0.6B, backend: faiss}
+  - id: hybrid_rrf
+    kind: retriever
+    params: {sources: bm25+qwen_dense, constant: 60}
+rerankers:
+  - id: retrieval_order
+    kind: reranker
+    params: {method: identity}
+  - id: minilm
+    kind: reranker
+    params: {model: cross-encoder/ms-marco-MiniLM-L6-v2}
+  - id: bge
+    kind: reranker
+    params: {model: BAAI/bge-reranker-v2-m3}
+  - id: qwen
+    kind: reranker
+    params: {model: Qwen/Qwen3-Reranker-0.6B}
+  - id: jev
+    kind: reranker
+    params: {provider: typesafe, mode: independent, answer_type: noul}
+generator:
+  provider: openrouter
+  model: moonshotai/kimi-k2.5
+  evidence_tokens: 4096
+  max_output_tokens: 768
