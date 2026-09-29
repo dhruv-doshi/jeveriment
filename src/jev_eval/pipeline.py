@@ -1,3 +1,4 @@
+import random
 import time
 import zipfile
 from pathlib import Path
@@ -431,17 +432,32 @@ def rerank(config_path, system="qwen", request_budget=None, token_budget=None):
                     state, questions, mapping = build_request(
                         queries[q]["text"], candidates, config.task, config.jev_mode
                     )
-                    response = client.evaluate(
-                        state,
-                        questions,
-                        provenance={
-                            "query_id": q,
-                            "pool": pool.ordered_input_hash,
-                            "corpus": config.corpus_revision,
-                            "views": [views[d]["hash"] for d in group],
-                            "mode": config.jev_mode,
-                        },
-                    )
+                    provenance = {
+                        "query_id": q,
+                        "pool": pool.ordered_input_hash,
+                        "corpus": config.corpus_revision,
+                        "views": [views[d]["hash"] for d in group],
+                        "mode": config.jev_mode,
+                    }
+                    for retry in range(config.max_attempts):
+                        try:
+                            response = client.evaluate(
+                                state, questions, provenance=provenance
+                            )
+                            break
+                        except RuntimeError as exc:
+                            if (
+                                not str(exc).startswith("TypeSafe HTTP 520;")
+                                or retry + 1 == config.max_attempts
+                            ):
+                                raise
+                            delay = min(2**retry + random.random(), 16)
+                            print(
+                                f"Jev HTTP 520; retrying query {q} after "
+                                f"{delay:.1f}s ({retry + 1}/{config.max_attempts - 1})",
+                                flush=True,
+                            )
+                            time.sleep(delay)
                     for key, d in mapping.items():
                         scores[d] = response["answers"][key]["noul"]
                     saved["scores"][q] = scores
