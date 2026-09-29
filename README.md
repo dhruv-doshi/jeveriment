@@ -35,4 +35,6 @@ An additional [decision benchmark](docs/PROJECT.md#acceptance-and-evidence-suffi
 
 Outputs, raw API responses, checkpoints, metrics, plots, resource records, and timestamped command logs are saved under `runs/<experiment_id>/`; a readable report is written to `reports/<experiment_id>.md`. These generated directories and `.env` are git-ignored. Back them up separately if you need to retain experiment data.
 
+After evaluation, compare Jev with Qwen across the same queries using `CONFIG=configs/core_scifact.yaml .venv/bin/python scripts/analyze_pairwise.py`. It prints and saves the paired nDCG@10 difference, query wins and losses, a confidence interval, and a randomization p-value without making API requests. Use `--baseline`, `--challenger`, and `--metric` for other comparisons; results remain exploratory when the run config has `confirmatory: false`.
+
 For architecture, outputs, limitations, and analysis guidance, read [the project walkthrough](docs/PROJECT.md). The [original study guide](docs/Jev_RAG_Retrieval_Final_Guide.md) and [verification notes](TESTING.md) provide further detail.
