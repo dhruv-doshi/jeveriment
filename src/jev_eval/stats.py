@@ -71,7 +71,7 @@ def paired_comparison(
         "ci95": np.quantile(boot, [0.025, 0.975]).tolist(),
         "p_value": p,
         "exact_randomization": exact,
-        "datasets_improved": sum(d.mean() > 1e-12 for d in diffs),
+        "datasets_improved": int(sum(d.mean() > 1e-12 for d in diffs)),
         "datasets": len(diffs),
         "query_count": len(all_d),
         "wins": int((all_d > 1e-12).sum()),
