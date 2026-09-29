@@ -23,6 +23,8 @@ When you are ready to run the pilot, execute each phase in order:
 
 `04_rerank.sh` can also run one system at a time: `./scripts/04_rerank.sh qwen`, then `bge`, then `jev`. Re-running a phase resumes validated checkpoints. Set `CONFIG=configs/core_nfcorpus.yaml` (or another config) to use a different experiment ID and output directory. Check its confirmatory gates before treating results as a study.
 
+Before a direct TypeSafe Jev rerank, run `.venv/bin/python -m jev_eval preflight` to create `manifests/capabilities_typesafe.json`. The default 1,800-request and 2-million-token caps fit the 30-query pilot, but not a full 300-query SciFact test run with 100 candidates per query. Set `JEV_RERANK_REQUEST_BUDGET` and `JEV_RERANK_TOKEN_BUDGET` when running `04_rerank.sh jev`; these execution caps can be increased without changing the frozen experiment config or completed local scores. The caps include earlier direct TypeSafe attempts recorded in `runs/budget_typesafe.sqlite`; the separate `JEV_MAX_COST_USD` limit in `.env` still applies.
+
 The prepared SciFact data and retrieval files are already available in the linked `runs/` directory for the direct scan, so you can go from direct preflight to `06_jev_scan.sh`. Use a new experiment ID if you also want direct fixed-pool reranking; the existing `scores_jev.json` belongs to the Vercel pilot.
 
 To test Jev as the **retriever itself**, use the separate, opt-in [full-corpus scan](docs/PROJECT.md#jev-as-a-first-stage-retriever) after Phase 3. It scores raw query/document text, not embeddings, and compares Jev's top results with BM25 and dense cosine retrieval. It is not included in the default five scripts because the 30-query SciFact pilot requires 155,490 Jev document evaluations.

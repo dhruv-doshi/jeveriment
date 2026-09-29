@@ -289,7 +289,13 @@ def retrieve(config_path):
     return {"queries": len(pools), "corpus": len(ids)}
 
 
-def rerank(config_path, system="qwen"):
+def rerank(config_path, system="qwen", request_budget=None, token_budget=None):
+    if system != "jev" and (request_budget is not None or token_budget is not None):
+        raise ValueError("Request and token budget overrides apply only to Jev")
+    if request_budget is not None and request_budget < 1:
+        raise ValueError("Jev request budget must be positive")
+    if token_budget is not None and token_budget < 1:
+        raise ValueError("Jev token budget must be positive")
     config, dest = load_run(config_path)
     queries, views = (
         read_json(dest / "queries.json"),
@@ -333,7 +339,13 @@ def rerank(config_path, system="qwen"):
         saved["requested_model"] = settings.model
         from .jev import JevClient
 
-        capabilities = read_json("manifests/capabilities_typesafe.json")
+        capabilities_path = Path("manifests/capabilities_typesafe.json")
+        if not capabilities_path.exists():
+            raise ValueError(
+                "Jev capability manifest missing; run "
+                "'.venv/bin/python -m jev_eval preflight' first"
+            )
+        capabilities = read_json(capabilities_path)
         if capabilities["status"] != "noul_functional_checks_passed":
             raise ValueError(
                 "Jev capability preflight must pass before benchmark requests"
@@ -345,10 +357,22 @@ def rerank(config_path, system="qwen"):
         client = JevClient(
             settings,
             dest,
-            config.token_budget,
-            config.request_budget,
+            token_budget if token_budget is not None else config.token_budget,
+            request_budget if request_budget is not None else config.request_budget,
             config.max_attempts,
         )
+        if config.jev_mode == "independent":
+            remaining = sum(
+                len(pool.candidates) - len(saved["scores"].get(q, {}))
+                for q, pool in pools.items()
+            )
+            minimum = client.ledger.totals()["attempts"] + remaining + 1
+            if client.request_budget < minimum:
+                raise ValueError(
+                    f"Jev request budget {client.request_budget} is below the "
+                    f"minimum {minimum} for remaining pairs and a sentinel; "
+                    "increase --request-budget (or JEV_RERANK_REQUEST_BUDGET)"
+                )
         client.sentinel()
     else:
         models = read_json(dest / "model_manifest.json")

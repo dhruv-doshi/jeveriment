@@ -15,5 +15,14 @@ for system in "${systems[@]}"; do
     qwen|bge|jev) ;;
     *) echo "Unknown system: $system (use qwen, bge, jev)" >&2; exit 2 ;;
   esac
-  run_logged "rerank_${system}" .venv/bin/python -m jev_eval rerank "$CONFIG" --system "$system" --resume
+  budget_args=()
+  if [[ "$system" == jev ]]; then
+    if [[ -n "${JEV_RERANK_REQUEST_BUDGET:-}" ]]; then
+      budget_args+=(--request-budget "$JEV_RERANK_REQUEST_BUDGET")
+    fi
+    if [[ -n "${JEV_RERANK_TOKEN_BUDGET:-}" ]]; then
+      budget_args+=(--token-budget "$JEV_RERANK_TOKEN_BUDGET")
+    fi
+  fi
+  run_logged "rerank_${system}" .venv/bin/python -m jev_eval rerank "$CONFIG" --system "$system" --resume "${budget_args[@]}"
 done

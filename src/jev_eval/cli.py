@@ -38,6 +38,8 @@ def main():
             command.add_argument(
                 "--system", choices=["qwen", "bge", "jev"], default="qwen"
             )
+            command.add_argument("--request-budget", type=int)
+            command.add_argument("--token-budget", type=int)
             command.add_argument(
                 "--resume",
                 action="store_true",
@@ -152,7 +154,15 @@ def main():
             kwargs = (
                 {"source": args.source}
                 if args.command == "prepare"
-                else ({"system": args.system} if args.command == "rerank" else {})
+                else (
+                    {
+                        "system": args.system,
+                        "request_budget": args.request_budget,
+                        "token_budget": args.token_budget,
+                    }
+                    if args.command == "rerank"
+                    else {}
+                )
             )
             print(
                 json.dumps(
