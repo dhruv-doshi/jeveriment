@@ -76,10 +76,11 @@ class JevClient:
         token_budget=2000000,
         request_budget=1800,
         max_attempts=5,
+        ledger_path="runs/budget_typesafe.sqlite",
     ):
         self.settings = settings
         self.run_dir = Path(run_dir)
-        self.ledger = Ledger("runs/budget_typesafe.sqlite")
+        self.ledger = Ledger(ledger_path)
         self.token_budget, self.request_budget = token_budget, request_budget
         self.max_attempts = max_attempts
         self.http = httpx.Client(
@@ -177,10 +178,14 @@ class JevClient:
                         "request": payload,
                         "error": type(exc).__name__,
                         "timestamp": now(),
+                        "elapsed_seconds": time.monotonic() - started,
                     },
                 )
                 self.ledger.finish(
-                    attempt, "transport_error", raw_path, error=type(exc).__name__
+                    attempt,
+                    "transport_error",
+                    raw_path,
+                    error=type(exc).__name__,
                 )
                 if retry + 1 == self.max_attempts:
                     raise RuntimeError(

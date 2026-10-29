@@ -2,7 +2,7 @@
 
 ## Purpose and current status
 
-This repository implements the retrieval study in the [original guide](Jev_RAG_Retrieval_Final_Guide.md). Every fixed-pool system reranks or selects from the same frozen candidate pool so comparisons isolate the scoring method. The 30-query SciFact feasibility pilot completed through Vercel AI Gateway; it is not a confirmatory result. This worktree adds a separate direct TypeSafe full-corpus scan. Direct scan results remain pending until a TypeSafe key is configured and its preflight and scan complete. No superiority claim follows from the pilot alone.
+This repository implements the retrieval study in the [original guide](Jev_RAG_Retrieval_Final_Guide.md). Every fixed-pool system reranks or selects from the same frozen candidate pool so comparisons isolate the scoring method. The 30-query SciFact train feasibility pilot completed through Vercel AI Gateway and a separate direct TypeSafe full-corpus scan. Both are exploratory and are not confirmatory results. The direct scan scored all 155,490 query/document pairs and compared Jev with BM25 and dense cosine on the same 30 queries. No superiority claim follows from this pilot alone.
 
 ## Five phases
 
@@ -41,6 +41,8 @@ The existing SciFact preparation and retrieval artifacts can be reused for the d
 Replace the budget placeholders with explicit positive integers. The direct scan defaults to 12 workers and at most 10 request starts per second. Add `--workers N --requests-per-second RATE` after the four required arguments to change these ceilings. A 429 or 529 response pauses all workers for the provider's `Retry-After` period when provided and halves the send rate; sustained successful requests gradually restore it up to the chosen ceiling. TypeSafe currently publishes 1,200 requests per minute and 250,000 tokens per second, but says the limits can change. Each worker owns its HTTP and SQLite connections. One process writes the checkpoint, and an exclusive direct-scan lock rejects a second copy.
 
 The scan checkpoints scores every 100 completed documents and at each completed query to `jev_scan_typesafe_scores.json`; successful direct requests are also cached in the direct ledger, so a rerun can recover work since the last score checkpoint. It prints document progress at each checkpoint. `retrieval_typesafe_summary.json`, `retrieval_typesafe_per_query_metrics.json`, and `retrieval_typesafe_*.trec` contain the matched comparison. Raw direct responses and sentinels are stored under `typesafe_scan/`; the Vercel scan files remain separate. Do not compare these full-corpus retrieval results directly with fixed-pool reranking scores as though the tasks had the same candidate access or cost.
+
+The completed 30-query SciFact train scan (25 September 2026) scored every pair. Jev achieved nDCG@10 0.768, Recall@10 0.883, MRR@10 0.742, and candidate recall 1.000. Dense cosine scored 0.735, 0.850, 0.704, and 1.000; BM25 scored 0.647, 0.817, 0.605, and 0.967. These exploratory train-split figures do not establish generalization or superiority. The TypeSafe ledger records $4.723 reported cost and $0.008 uncertain reservation. CPU monitoring recorded 150 one-minute samples: mean 6.4%, peak 12.5%; sampled resident memory ranged from 80.5 to 135.7 MB. One API throttle was handled by the shared limiter and the scan completed.
 
 ## Acceptance and evidence sufficiency
 

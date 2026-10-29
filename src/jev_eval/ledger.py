@@ -16,7 +16,10 @@ def now():
 class Ledger:
     def __init__(self, path):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(path, timeout=30)
+        # Parallel scan workers each own a Ledger connection. They use it only
+        # on their worker thread; disabling SQLite's thread check lets the
+        # main thread close those connections after the executor has joined.
+        self.db = sqlite3.connect(path, timeout=30, check_same_thread=False)
         for attempt in range(10):
             try:
                 self.db.execute("PRAGMA journal_mode=WAL")

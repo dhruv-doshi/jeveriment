@@ -2,7 +2,7 @@
 
 **Research date: 22 September 2026**  
 **Target machine: MacBook M4 Air, 16 GB unified memory**  
-**Status: researched design; no benchmark results or live Jev capability tests have been run.**
+**Status: design and execution guide; pilot results and live capability checks are recorded in the [current project walkthrough](PROJECT.md).**
 
 ## 1. Executive summary
 

@@ -15,12 +15,15 @@ budget persistence, model drift, synthetic end-to-end exports/fallback, tiny-mod
 CPU inference, fusion leakage/search budgets, calibration, statistics, blinded
 audit requirements, plotting, remote score validation, and RAG evidence/resume.
 
-SciFact preparation completed locally; dense retrieval stopped during pretrained
-weight download, and no benchmark ranking/evaluation has run. Tests use authored
-data and tiny random architectures; pretrained-model quality,
-MPS performance, full-study resource usage, multilingual quality, and human
+The 30-query SciFact train pilot has since completed through both the fixed-pool
+Vercel workflow and the direct TypeSafe full-corpus scan. The direct scan scored
+155,490 pairs and completed its BM25/dense/TypeSafe comparison; metrics and CPU
+samples are recorded in `runs/scifact_train_pilot_v1/` and summarized in
+`docs/PROJECT.md`. These train-split pilot results are exploratory. Tests listed
+above use authored data and tiny random architectures; pretrained-model quality,
+MPS performance, multi-domain resource use, multilingual quality, and human
 calibration/generation judgments remain experimental validation work.
 
-The guide's optional expansion paths have code support, but no remote scorer or
-generator configuration has been selected or executed. No SOTA, accuracy,
-calibration, or study-completion claim is made.
+The guide's other optional expansion paths have code support, but no additional
+remote scorer or generator configuration has been selected or executed. No SOTA,
+calibration, or broad study-completion claim is made.
